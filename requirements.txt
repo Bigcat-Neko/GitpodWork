@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-dotenv
+SQLAlchemy
+aiosmtplib
+MetaTrader5
+tensorflow==2.18.0
+xgboost
+pandas
+pandas_ta
+numpy==1.26.0
+requests
+pytz
+python-telegram-bot==21.11.1
+passlib
+jose
