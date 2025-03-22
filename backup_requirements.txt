@@ -96,7 +96,6 @@ MarkupSafe==3.0.2
 matplotlib==3.10.1
 matplotlib-inline==0.1.7
 mdurl==0.1.2
-MetaTrader5==5.0.4874
 ml-dtypes==0.4.1
 mpmath==1.3.0
 multidict==6.1.0
