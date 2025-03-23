@@ -8,39 +8,28 @@ from tensorflow.keras.optimizers import Adam
 from sklearn.model_selection import train_test_split
 from preprocess_features import create_features_targets
 
-# Load data from the data folder
 data = pd.read_csv("data/forex_data_preprocessed.csv", parse_dates=["date", "fetched_at"])
 X, y = create_features_targets(data, window_size=10)
-
-# Reshape X for CNN: (samples, timesteps, features) – here, one feature per timestep
 X = X.reshape((X.shape[0], X.shape[1], 1))
-
-# Split into training and validation sets
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
 def create_cnn_model(input_shape):
     model = Sequential([
-        Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=input_shape),
+        Conv1D(32, kernel_size=3, activation='relu', input_shape=input_shape),
         MaxPooling1D(pool_size=2),
         Dropout(0.2),
-        Conv1D(filters=64, kernel_size=3, activation='relu'),
+        Conv1D(64, kernel_size=3, activation='relu'),
         MaxPooling1D(pool_size=2),
         Dropout(0.2),
         Flatten(),
         Dense(50, activation='relu'),
-        Dense(1, activation='linear')  # linear activation for regression
+        Dense(1, activation='linear')
     ])
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
     return model
 
-# Create and train the model
-input_shape = (X_train.shape[1], X_train.shape[2])
-cnn_model = create_cnn_model(input_shape)
-
+model = create_cnn_model((X_train.shape[1], X_train.shape[2]))
 print("Training CNN model...")
-history = cnn_model.fit(X_train, y_train, epochs=50, batch_size=32,
-                        validation_data=(X_val, y_val))
-
-# Save the model for production
-cnn_model.save("models/cnn_model.h5")
+history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val))
+model.save("models/cnn_model.h5")
 print("CNN model saved as models/cnn_model.h5")

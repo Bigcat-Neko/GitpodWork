@@ -1,52 +1,34 @@
-import pandas as pd
+# train_gru.py
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import GRU, Dense
-from sklearn.preprocessing import MinMaxScaler
-import pickle
+from tensorflow.keras.layers import GRU, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+from preprocess_features import create_features_targets
 
-# Load your preprocessed data (ensure it has a 'close' column)
-df = pd.read_csv("data/forex_data_preprocessed.csv")
-if "close" not in df.columns:
-    raise Exception("The preprocessed data must have a 'close' column.")
-prices = df["close"].values.reshape(-1, 1)
+data = pd.read_csv("data/forex_data_preprocessed.csv", parse_dates=["date", "fetched_at"])
+X, y = create_features_targets(data, window_size=10)
 
-# Normalize the price data
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_prices = scaler.fit_transform(prices)
+# Reshape for GRU
+X = X.reshape((X.shape[0], X.shape[1], 1))
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Save the scaler for later use in inference
-with open("models/price_scaler.pkl", "wb") as f:
-    pickle.dump(scaler, f)
-print("Price scaler saved.")
+def create_gru_model(input_shape):
+    model = Sequential([
+        GRU(50, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        GRU(50),
+        Dropout(0.2),
+        Dense(25, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    return model
 
-# Create sequences for GRU training (using a look-back of 60)
-def create_dataset(dataset, look_back=60):
-    X, y = [], []
-    for i in range(len(dataset) - look_back):
-        X.append(dataset[i:i+look_back, 0])
-        # Label: 1 if next price is higher than previous, else 0
-        y.append(1 if dataset[i+look_back, 0] > dataset[i+look_back-1, 0] else 0)
-    return np.array(X), np.array(y)
-
-look_back = 60
-X_data, y_data = create_dataset(scaled_prices, look_back)
-X_data = np.reshape(X_data, (X_data.shape[0], X_data.shape[1], 1))  # for GRU input
-
-# ------------------------------
-# Step 1.2: Build and Train the GRU Model
-# ------------------------------
-gru_model = Sequential([
-    GRU(50, return_sequences=True, input_shape=(look_back, 1)),
-    GRU(50),
-    Dense(1, activation='sigmoid')
-])
-gru_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=["accuracy"])
-
-# Train extensively (e.g., 50 epochs, with early stopping)
-from tensorflow.keras.callbacks import EarlyStopping
-early_stop = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-gru_model.fit(X_data, y_data, epochs=50, batch_size=32, verbose=1, callbacks=[early_stop])
-gru_model.save("models/gru_model.h5")
-print("GRU model trained and saved as 'models/gru_model.h5'.")
+model = create_gru_model((X_train.shape[1], X_train.shape[2]))
+print("Training GRU model...")
+history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val))
+model.save("models/gru_model.h5")
+print("GRU model saved as models/gru_model.h5")
