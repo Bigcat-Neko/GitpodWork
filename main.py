@@ -1,129 +1,45 @@
+# main.py - NEKO AI Premium Trader (Complete & Enhanced with MT5 Trading)
+
 import os
 import time
 import threading
 import asyncio
-import random
 import numpy as np
-
-# Ensure np.NaN exists for pandas_ta
-if not hasattr(np, 'NaN'):
-    np.NaN = np.nan
-
 import pandas as pd
 import requests
-import tensorflow as tf
-import pickle
-import xgboost as xgb
-
-# Disable CUDA to force CPU usage
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
-# Attempt to import MetaTrader5; if unavailable, log a warning.
-try:
-    import MetaTrader5 as mt5  # type: ignore
-except ImportError:
-    mt5 = None
-    import logging
-    logging.warning("MetaTrader5 module not available. Running without MT5 execution.")
-
 import logging
 import pytz
+import json
+import aiohttp
+import MetaTrader5 as mt5
 from datetime import datetime, timedelta, time as dt_time
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, WebSocket, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
+from typing import Optional, List, Dict, Any, Tuple
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import pandas_ta as ta
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+from prophet import Prophet
+import joblib
+from passlib.context import CryptContext
 from jose import JWTError, jwt
 from queue import Queue
 from dotenv import load_dotenv
-
-# Allow nested asyncio loops
+from stable_baselines3 import DQN, PPO
+from tensorflow.keras.losses import MeanSquaredError  # Preserved if needed
 import nest_asyncio
 nest_asyncio.apply()
 
-# Import telegram components from python-telegram-bot
-from telegram import Update
-from telegram.ext import Application as TGApplication, CommandHandler, ContextTypes
-
-import pandas_ta as ta
-from passlib.context import CryptContext
-from typing import List, Dict, Any
-
-# -------------------------------
-# Database Setup (SQLite with SQLAlchemy)
-# -------------------------------
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-
-from tensorflow.keras.losses import MeanSquaredError  # type: ignore
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./users.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal_DB = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    broker_info = Column(String, nullable=True)  # JSON string with broker account details
-    registered_at = Column(DateTime, default=datetime.utcnow)
-
-Base.metadata.create_all(bind=engine)
-
-# -------------------------------
-# Environment & Logging Setup
-# -------------------------------
-load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logging.getLogger("absl").setLevel(logging.WARNING)
-logging.getLogger("tensorflow").setLevel(logging.WARNING)
-
-# Environment variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
-MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0"))
-MT5_PASSWORD = os.getenv("MT5_PASSWORD")
-MT5_SERVER = os.getenv("MT5_SERVER")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
-SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-# -------------------------------
-# Adjustable Parameters & Risk Settings
-# -------------------------------
-TP_MULTIPLIER = 2.0          # Multiplier for take profit calculation
-SL_MULTIPLIER = 1.5          # Multiplier for stop loss calculation
-MONITOR_INTERVAL = 30        # Seconds between trade monitoring updates
-PROFIT_THRESHOLD_CLOSE = 3.0 # % profit threshold to auto-close trade
-DECAY_FACTOR = 0.9           # Smoothing factor for ensemble error calculations
-
-# -------------------------------
-# Manual Mode & Execution Variables
-# -------------------------------
-manual_mode_override = False  # When True, manual mode is active
-manual_mode = None            # "forex" or "crypto" manually selected
-monitor_only_mode = True      # In development, only signals are sent; trade execution is via Telegram command
-
-# -------------------------------
-# FastAPI Initialization
-# -------------------------------
-app = FastAPI(title="NEKO AI Trading API")
+# ---------------- FastAPI App Initialization ----------------
+# Place the FastAPI app definition at the top so it is available to all code.
+app = FastAPI(title="NEKO AI Premium Trader")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -131,71 +47,108 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-try:
-    event_loop = asyncio.get_running_loop()
-except RuntimeError:
-    event_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(event_loop)
 
-# -------------------------------
-# Global Variables and Queues
-# -------------------------------
-connected_clients: List[WebSocket] = []
-trade_queue = Queue()
-active_trades: Dict[str, Any] = {}    # Active trade signals keyed by signal ID
-historical_trades: List[Dict[str, Any]] = []  # All generated trade signals
-signal_counter = 0           # Global signal counter
-last_news_update = ""        # For duplicate news prevention
+# ---------------- Environment Setup ----------------
+load_dotenv()
+NEWSAPI_KEY = os.getenv("NEWS_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+MT5_LOGIN = os.getenv("MT5_LOGIN")
+MT5_PASSWORD = os.getenv("MT5_PASSWORD")
+MT5_SERVER = os.getenv("MT5_SERVER")
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "noreply@yourdomain.com")
+
+# ---------------- Logging Setup ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+logger.info(f"NEWS_API_KEY: {'set' if NEWSAPI_KEY else 'NOT set'}")
+logger.info(f"TELEGRAM_BOT_TOKEN: {'set' if TELEGRAM_BOT_TOKEN else 'NOT set'}")
+logger.info(f"TELEGRAM_CHAT_ID: {'set' if TELEGRAM_CHAT_ID else 'NOT set'}")
+logger.info(f"TELEGRAM_CHANNEL_ID: {'set' if TELEGRAM_CHANNEL_ID else 'NOT set'}")
+
+# ---------------- Disable GPU for TensorFlow ----------------
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+tf.config.set_visible_devices([], "GPU")
+tf.get_logger().setLevel('ERROR')
+tf.autograph.set_verbosity(0)
+nest_asyncio.apply()
+
+# ---------------- Global Variables ----------------
+models = {}  # Global dictionary for all models
+model_lock = threading.Lock()  # Lock for safe model loading
 signal_generation_active = True
-last_trading_mode = None     # "forex" or "crypto"
-last_signal_time: Dict[str, float] = {}        # To avoid duplicate signals per asset
-total_loss_today = 0.0
-current_day = datetime.now().date()
+active_trades = {}
+historical_trades = []
+signal_queue = Queue()
 
-# -------------------------------
-# Database Dependency for FastAPI
-# -------------------------------
-def get_db():
-    db = SessionLocal_DB()
-    try:
-        yield db
-    finally:
-        db.close()
+# ---------------- Database Setup ----------------
+Base = declarative_base()
 
-# -------------------------------
-# User Models for Registration & Authentication
-# -------------------------------
-class UserCreate(BaseModel):
-    username: str
-    email: EmailStr
-    password: str
+class TradeSignal(Base):
+    __tablename__ = "trade_signals"
+    id = Column(Integer, primary_key=True, index=True)
+    asset = Column(String)
+    signal = Column(String)
+    price = Column(Float)
+    confidence = Column(Float)
+    tp_levels = Column(JSON)
+    sl_level = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    indicators = Column(JSON)
+    predictions = Column(JSON)
+    news_sentiment = Column(String)
 
-class UserOut(BaseModel):
-    username: str
-    email: EmailStr
-    registered_at: datetime
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base.metadata.create_all(bind=engine)
 
-# -------------------------------
-# Utility Functions: Password Hashing and Token Generation
-# -------------------------------
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    broker_info = Column(String, nullable=True)
+    registered_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+class Feedback(BaseModel):
+    signal_id: str
+    rating: int
+    comment: Optional[str] = None
+
+# ---------------- Security Configuration ----------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-def verify_password(plain_password, hashed_password):
+def verify_password(plain_password: str, hashed_password: str):
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+def get_password_hash(password: str):
     return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# -------------------------------
-# Email Sending Function (Using aiosmtplib)
-# -------------------------------
+# ---------------- Email Sending Function ----------------
 import aiosmtplib
 from email.message import EmailMessage
 
@@ -215,13 +168,31 @@ async def send_email(to_email: str, subject: str, body: str):
             start_tls=True,
         )
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
+        logger.error(f"Error sending email: {e}")
 
-# -------------------------------
-# User Registration Endpoint
-# -------------------------------
+# ---------------- API Dependency ----------------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ---------------- User Endpoints ----------------
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+
+class UserOut(BaseModel):
+    username: str
+    email: EmailStr
+    registered_at: datetime
+
+from fastapi.security import OAuth2PasswordRequestForm
+
 @app.post("/register", response_model=UserOut)
-def register(user: UserCreate, db: SessionLocal_DB = Depends(get_db)):  # type: ignore
+def register(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter((User.username == user.username) | (User.email == user.email)).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Username or email already registered")
@@ -234,33 +205,14 @@ def register(user: UserCreate, db: SessionLocal_DB = Depends(get_db)):  # type: 
     asyncio.run(send_email(new_user.email, "Your Login Token", f"Your token is: {token}"))
     return new_user
 
-# -------------------------------
-# User Login Endpoint
-# -------------------------------
 @app.post("/token")
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal_DB = Depends(get_db)):  # type: ignore
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
     access_token = create_access_token({"sub": user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     return {"access_token": access_token, "token_type": "bearer"}
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal_DB = Depends(get_db)):  # type: ignore
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate token")
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    return user
-
-# -------------------------------
-# Broker Account Linking Endpoint
-# -------------------------------
 class BrokerLink(BaseModel):
     broker: str
     broker_username: str
@@ -268,154 +220,76 @@ class BrokerLink(BaseModel):
     broker_server: str
 
 @app.post("/link_broker")
-def link_broker(broker_info: BrokerLink, current_user: User = Depends(get_current_user), db: SessionLocal_DB = Depends(get_db)):  # type: ignore
-    import json
+def link_broker(broker_info: BrokerLink, db: Session = Depends(get_db)):
+    current_user = db.query(User).first()  # In production, use proper authentication
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
     current_user.broker_info = json.dumps(broker_info.dict())
     db.add(current_user)
     db.commit()
     return {"message": "Broker account linked successfully."}
 
-# -------------------------------
-# Model Loading Functions
-# -------------------------------
-import lightgbm as lgb
-import joblib
+# ---------------- Adjustable Trading & Risk Settings ----------------
+TP_MULTIPLIER = 2.0
+SL_MULTIPLIER = 1.5
+MONITOR_INTERVAL = 30
+PROFIT_THRESHOLD_CLOSE = 3.0
+DECAY_FACTOR = 0.9
 
-def load_models():
-    models = {}
+manual_mode_override = False
+manual_mode: Optional[str] = None
+monitor_only_mode = False
 
-    # Load CNN Model
-    cnn_model_path = "models/cnn_model.h5"
-    if os.path.exists(cnn_model_path):
-        models["cnn"] = tf.keras.models.load_model(cnn_model_path, custom_objects={"mse": MeanSquaredError()})
-        print("[✅] CNN Model Loaded Successfully!")
-    else:
-        print("[❌] CNN Model Not Found!")
+# ---------------- Additional Global Variables ----------------
+connected_clients: List[WebSocket] = []
+trade_queue = Queue()
+active_trades: Dict[str, Any] = {}
+historical_trades: List[Dict[str, Any]] = []
+trading_mode_override: Optional[str] = None
+last_signal_time: Dict[str, float] = {}
+total_loss_today = 0.0
+current_day = datetime.now().date()
+user_risk_reward_ratio = 0.5
+feedback_list: List[Dict[str, Any]] = []
 
-    # Load LightGBM Model
-    lightgbm_model_path = "models/lightgbm_model.txt"
-    if os.path.exists(lightgbm_model_path):
-        models["lightgbm"] = lgb.Booster(model_file=lightgbm_model_path)
-        print("[✅] LightGBM Model Loaded Successfully!")
-    else:
-        print("[❌] LightGBM Model Not Found!")
+# ---------------- Intelligent Rate Limiter ----------------
+class IntelligentRateLimiter:
+    def __init__(self, max_calls=8, period=60):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+        
+    async def acquire(self):
+        while True:
+            now = time.time()
+            self.calls = [t for t in self.calls if t > now - self.period]
+            if len(self.calls) < self.max_calls:
+                self.calls.append(now)
+                return
+            sleep_time = self.period - (now - self.calls[0])
+            logger.warning(f"Rate limit exceeded. Sleeping {sleep_time:.1f}s")
+            await asyncio.sleep(sleep_time)
 
-    # Load Stacking Model
-    stacking_model_path = "models/stacking_model.pkl"
-    if os.path.exists(stacking_model_path):
-        models["stacking"] = joblib.load(stacking_model_path)
-        print("[✅] Stacking Model Loaded Successfully!")
-    else:
-        print("[❌] Stacking Model Not Found!")
+rate_limiter = IntelligentRateLimiter()
 
-    return models
-
-# Call the function to load models and assign to global variable
-models = load_models()
-
-# -------------------------------
-# Testing AI Model Predictions
-# -------------------------------
-# Generate a random input sample (replace with real market data)
-sample_input = np.random.random((1, 3))  # Assuming 3 features: moving_avg, rsi, volatility
-
-print("\n🔍 Testing AI Model Predictions:\n")
-if "cnn" in models:
-    try:
-        cnn_prediction = models["cnn"].predict(sample_input)
-        print(f"[🔮] CNN Prediction: {cnn_prediction}")
-    except Exception as e:
-        print(f"[❌] Error predicting with CNN model: {e}")
-
-if "lightgbm" in models:
-    try:
-        lightgbm_prediction = models["lightgbm"].predict(sample_input.reshape(1, -1))
-        print(f"[🔮] LightGBM Prediction: {lightgbm_prediction}")
-    except Exception as e:
-        print(f"[❌] Error predicting with LightGBM model: {e}")
-
-if "stacking" in models:
-    try:
-        stacking_prediction = models["stacking"].predict(sample_input)
-        print(f"[🔮] Stacking Model Prediction: {stacking_prediction}")
-    except Exception as e:
-        print(f"[❌] Error predicting with Stacking model: {e}")
-
-# -------------------------------
-# Additional Model & Supporting Object Loading with Debug Logging
-# -------------------------------
-logging.info("[DEBUG] Loading additional models...")
-try:
-    lstm_model = tf.keras.models.load_model("models/trade_signal_model.h5")
-    logging.info("[DEBUG] LSTM model loaded successfully.")
-except Exception as e:
-    raise Exception(f"LSTM model load failed: {e}")
-try:
-    gru_model = tf.keras.models.load_model("models/gru_model.h5")
-    logging.info("[DEBUG] GRU model loaded successfully.")
-except Exception as e:
-    raise Exception(f"GRU model load failed: {e}")
-try:
-    from stable_baselines3 import DQN, PPO
-    dqn_model = DQN.load("models/trading_dqn.zip")
-    logging.info("[DEBUG] DQN model loaded successfully.")
-except Exception as e:
-    raise Exception(f"DQN model load failed: {e}")
-try:
-    ppo_model = PPO.load("models/trading_ppo.zip")
-    logging.info("[DEBUG] PPO model loaded successfully.")
-except Exception as e:
-    raise Exception(f"PPO model load failed: {e}")
-try:
-    with open("models/price_scaler.pkl", "rb") as f:
-        scaler = pickle.load(f)
-    logging.info("[DEBUG] Price scaler loaded successfully.")
-except Exception as e:
-    raise Exception(f"Scaler load failed: {e}")
-try:
-    with open("models/sentiment_model.pkl", "rb") as f:
-        sentiment_pipeline = pickle.load(f)
-    logging.info("[DEBUG] Sentiment model loaded successfully.")
-except Exception as e:
-    raise Exception(f"Sentiment model load failed: {e}")
-try:
-    with open("models/anomaly_model.pkl", "rb") as f:
-        anomaly_model = pickle.load(f)
-    logging.info("[DEBUG] Anomaly model loaded successfully.")
-except Exception as e:
-    raise Exception(f"Anomaly model load failed: {e}")
-try:
-    xgb_model = xgb.XGBRegressor()
-    xgb_model.load_model("models/xgboost_model.json")
-    logging.info("[DEBUG] XGBoost model loaded successfully.")
-except Exception as e:
-    raise Exception(f"XGBoost model load failed: {e}")
-
-# -------------------------------
-# MT5 Trading Functions (Development: no execution)
-# -------------------------------
+# ---------------- MT5 Trading Functions ----------------
 def initialize_mt5(max_attempts=5):
-    if mt5 is not None:
+    attempts = 0
+    while attempts < max_attempts:
         if mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-            logging.info("MT5 Initialized successfully.")
+            logger.info("MT5 initialized successfully.")
             return True
         else:
-            error_code, error_msg = mt5.last_error()
-            logging.error(f"MT5 Initialization failed: {error_msg}")
-    else:
-        logging.warning("MT5 module not available.")
+            logger.error(f"MT5 initialization failed: {mt5.last_error()}")
+            attempts += 1
+            time.sleep(5)
     return False
 
 def shutdown_mt5():
-    if mt5 is not None:
-        mt5.shutdown()
+    mt5.shutdown()
 
 def place_mt5_order(symbol, order_type, volume, price, sl, tp, signal_id):
-    if mt5 is None:
-        logging.warning("MT5 module not available. Skipping order placement.")
-        return None
-    logging.info(f"Placing order for {symbol}: {order_type} at {price} with SL={sl} TP={tp}")
-    result = mt5.order_send({
+    request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol.replace("/", ""),
         "volume": volume,
@@ -428,165 +302,312 @@ def place_mt5_order(symbol, order_type, volume, price, sl, tp, signal_id):
         "comment": f"Trade Signal {signal_id}",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_FOK,
-    })
+    }
+    result = mt5.order_send(request)
     return result
 
-def close_trade(ticket, signal_id, symbol):
-    logging.info(f"Trade {signal_id} would be closed here (MT5 execution not available).")
+async def monitor_trades():
+    """Continuously monitor open MT5 trades and update Telegram if SL/TP adjustments are needed."""
+    while True:
+        open_trades = mt5.positions_get()
+        if open_trades:
+            for trade in open_trades:
+                profit = trade.profit
+                symbol = trade.symbol
+                ticket = trade.ticket
+                if profit > 10:  # Adjust threshold as needed
+                    message = f"Trade {ticket} on {symbol} has profit {profit:.2f}. Consider reviewing SL/TP."
+                    send_telegram_message(message, to_channel=False)
+        await asyncio.sleep(60)
 
-def get_account_info():
-    if mt5 is not None:
-        return mt5.account_info()
-    return None
+# ---------------- Model Loading System ----------------
+def load_all_models():
+    global models
+    model_paths = {
+        "lstm": "models/lstm_model.keras",
+        "gru": "models/gru_model.keras",
+        "cnn": "models/cnn_model.keras",
+        "transformer": "models/transformer_model.keras",
+        "xgb": "models/xgboost_model.json",
+        "lightgbm": "models/lightgbm_model.txt",
+        "catboost": "models/catboost_model.cbm",
+        "stacking": "models/stacking_model.pkl",
+        "gaussian": "models/gaussian_process_model.pkl",
+        "prophet": "models/prophet_model.pkl",
+        "sentiment": "models/sentiment_model.keras",
+        "sentiment_tokenizer": "models/sentiment_tokenizer.pkl",
+        "anomaly": "models/anomaly_model.keras",
+        "scaler": "models/price_scaler.pkl",
+        "dqn": "models/dqn_model.zip",
+        "ppo": "models/ppo_model.zip",
+        "svr": "models/svr_model.pkl"
+    }
+    with model_lock:
+        for name, path in model_paths.items():
+            try:
+                if not os.path.exists(path):
+                    logger.warning(f"Model file missing: {path}")
+                    continue
+                if name.endswith(".keras"):
+                    models[name] = tf.keras.models.load_model(path)
+                elif name == "xgb":
+                    models[name] = xgb.XGBRegressor()
+                    models[name].load_model(path)
+                elif name == "lightgbm":
+                    models[name] = lgb.Booster(model_file=path, params={'predict_disable_shape_check': True})
+                elif name == "catboost":
+                    models[name] = CatBoostRegressor()
+                    models[name].load_model(path)
+                elif name.endswith(".pkl"):
+                    with open(path, "rb") as f:
+                        models[name] = joblib.load(f)
+                elif name in ["dqn", "ppo"]:
+                    models[name] = DQN.load(path) if name == "dqn" else PPO.load(path)
+                elif name == "svr":
+                    with open(path, "rb") as f:
+                        models[name] = joblib.load(f)
+                logger.info(f"Successfully loaded {name}")
+            except Exception as e:
+                logger.error(f"Error loading {name}: {str(e)}")
+    return models
 
-def monitor_trade(signal_id, mt5_order_ticket, symbol, entry_price):
-    logging.info(f"Monitoring trade {signal_id} (MT5 execution not available).")
-
-# -------------------------------
-# Extended Live Data Function (TwelveData API)
-# -------------------------------
-def get_extended_live_data(symbol="EUR/USD", interval="1min", outputsize=60, max_retries=5):
+# ---------------- Data Fetching Function ----------------
+async def fetch_market_data(symbol: str, asset_type: str):
+    await rate_limiter.acquire()
+    base_url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY
+        "interval": "1min",
+        "outputsize": 200,
+        "apikey": TWELVEDATA_API_KEY,
+        "format": "JSON"
     }
-    base_url = "https://api.twelvedata.com/time_series"
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(base_url, params=params, timeout=10)
-            data = response.json()
-            if "values" in data:
-                prices = [float(item["close"]) for item in data["values"]]
-                volumes = [float(item["volume"]) for item in data["values"]] if "volume" in data["values"][0] else None
-                prices = np.array(prices[::-1]).reshape(-1, 1)
-                if volumes is not None:
-                    volumes = np.array(volumes[::-1]).reshape(-1, 1)
-                return prices, volumes
-            else:
-                logging.error(f"Error fetching extended live data: {data}")
-        except Exception as e:
-            logging.error(f"Exception fetching {symbol}: {e}")
-        time.sleep(2)
-    logging.error(f"Failed to fetch data for {symbol} after {max_retries} attempts.")
-    return None, None
-
-# -------------------------------
-# Economic Indicator Integration (Alpha Vantage)
-# -------------------------------
-def get_economic_indicators(function="GDP"):
-    url = "https://www.alphavantage.co/query"
-    params = {"function": function, "apikey": ALPHAVANTAGE_API_KEY}
+    if asset_type == "crypto":
+        params.update({"exchange": "Binance", "type": "digital_currency"})
     try:
-        response = requests.get(url, params=params, timeout=10)
-        return response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base_url, params=params) as response:
+                if response.status != 200:
+                    logger.error(f"API error {response.status}: {await response.text()}")
+                    return None
+                data = await response.json()
+                if "values" not in data:
+                    logger.error(f"Invalid data format for {symbol}: {data}")
+                    return None
+                df = pd.DataFrame(data["values"])
+                df = df.rename(columns={"datetime": "timestamp"})
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df.sort_values("timestamp", ascending=True)
+                for col in ["open", "high", "low", "close"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df.dropna()
     except Exception as e:
-        logging.error(f"Error fetching economic indicators: {e}")
-        return {}
+        logger.error(f"Data fetch failed for {symbol}: {str(e)}")
+        return None
 
-# -------------------------------
-# Technical Indicator Computation
-# -------------------------------
-def compute_indicators(df):
-    df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-    macd = ta.trend.MACD(df["close"]).macd()
-    df["MACD_12_26_9"] = macd
-    df["ATR_14"] = ta.volatility.AverageTrueRange(df["close"], df["close"], df["close"], window=14).average_true_range()
-    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2.0)
-    df["BBM_20_2.0"] = bb.bollinger_mavg()
-    df["STD_20"] = df["close"].rolling(window=20).std()
-    return df
+# ---------------- News & Sentiment ----------------
+async def fetch_market_news(asset_type: str):
+    if not NEWSAPI_KEY:
+        logger.warning("NEWS_API_KEY is not set; skipping news fetch.")
+        return []
+    url = "https://newsapi.org/v2/top-headlines"
+    params = {"category": "business", "language": "en", "apiKey": NEWSAPI_KEY, "pageSize": 5}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    logger.error(f"News API error {response.status}: {await response.text()}")
+                    return []
+                data = await response.json()
+                return data.get("articles", [])
+    except Exception as e:
+        logger.error(f"News fetch failed: {str(e)}")
+        return []
 
-def compute_custom_indicators(df):
-    df["SMA_20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
-    df["SMA_50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
-    df["Momentum"] = df["close"] - df["close"].shift(4)
-    return df
-
-# -------------------------------
-# Ensemble Weighting & Prediction Functions
-# -------------------------------
-lstm_error_total = 0.0
-gru_error_total = 0.0
-xgb_error_total = 0.0
-error_count = 0
-ensemble_values = []
-
-def update_errors(actual_price, lstm_pred, gru_pred, xgb_pred):
-    global lstm_error_total, gru_error_total, xgb_error_total, error_count
-    lstm_error_total = DECAY_FACTOR * lstm_error_total + abs(actual_price - lstm_pred)
-    gru_error_total = DECAY_FACTOR * gru_error_total + abs(actual_price - gru_pred)
-    xgb_error_total = DECAY_FACTOR * xgb_error_total + abs(actual_price - xgb_pred)
-    error_count += 1
-
-def dynamic_weights():
-    if error_count == 0:
-        return [0.33, 0.33, 0.34]
-    lstm_weight = 1 / (lstm_error_total / error_count)
-    gru_weight = 1 / (gru_error_total / error_count)
-    xgb_weight = 1 / (xgb_error_total / error_count)
-    total = lstm_weight + gru_weight + xgb_weight
-    return [lstm_weight / total, gru_weight / total, xgb_weight / total]
-
-def get_smoothed_ensemble_value(new_value, window=5):
-    ensemble_values.append(new_value)
-    if len(ensemble_values) > window:
-        ensemble_values.pop(0)
-    return sum(ensemble_values) / len(ensemble_values)
-
-def standard_prediction(lstm_pred, gru_pred, xgb_pred):
-    return (lstm_pred + gru_pred + xgb_pred) / 3.0
-
-# -------------------------------
-# Trade Parameter Calculation (Enhanced TP and SL)
-# -------------------------------
-def calculate_trade_parameters(last_price, final_signal, atr_value, custom_ratio: float = None):
-    ratio = custom_ratio if custom_ratio is not None else user_risk_reward_ratio
-    if final_signal == "BUY":
-        tp_distance = atr_value * 4  
-        sl_distance = tp_distance * ratio  
-        TP1 = last_price + tp_distance * 0.3
-        TP2 = last_price + tp_distance * 0.6
-        TP3 = last_price + tp_distance * 0.9
-        TP4 = last_price + tp_distance * 1.2
-        SL = last_price - sl_distance
-    elif final_signal == "SELL":
-        tp_distance = atr_value * 4
-        sl_distance = tp_distance * ratio
-        TP1 = last_price - tp_distance * 0.3
-        TP2 = last_price - tp_distance * 0.6
-        TP3 = last_price - tp_distance * 0.9
-        TP4 = last_price - tp_distance * 1.2
-        SL = last_price + sl_distance
+def analyze_sentiment(news_articles: List[dict]) -> str:
+    positive_words = ["up", "gain", "bull", "soar", "surge", "improve", "rally", "optimism"]
+    negative_words = ["down", "loss", "bear", "plunge", "drop", "decline", "pessimism"]
+    if not news_articles:
+        return "NEUTRAL"
+    pos_count = 0
+    neg_count = 0
+    for article in news_articles:
+        text = (article.get("title", "") + " " + article.get("description", "")).lower()
+        for word in positive_words:
+            if word in text:
+                pos_count += 1
+        for word in negative_words:
+            if word in text:
+                neg_count += 1
+    if pos_count > neg_count:
+        return "POSITIVE"
+    elif neg_count > pos_count:
+        return "NEGATIVE"
     else:
-        TP1 = TP2 = TP3 = TP4 = SL = None
-    return TP1, TP2, TP3, TP4, SL
+        return "NEUTRAL"
 
-# -------------------------------
-# Duplicate Signal Prevention
-# -------------------------------
-def can_send_signal(asset):
-    now = time.time()
-    if asset in last_signal_time:
-        if now - last_signal_time[asset] < 300:
-            return False
-    last_signal_time[asset] = now
-    return True
+# ---------------- Professional Indicators ----------------
+def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        df['RSI'] = ta.rsi(df['close'], length=14).fillna(50)
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        df = df.join(macd, how='left')
+        bb = ta.bbands(df['close'], length=20, std=2)
+        df = df.join(bb, how='left')
+        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['ADX'] = adx['ADX_14']
+        ichimoku = ta.ichimoku(df['high'], df['low'], df['close'])
+        df['ICHIMOKU'] = ichimoku[0]['ITS_9']
+        volume = df['volume'] if 'volume' in df.columns else df['close']
+        df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], volume)
+        df['OBV'] = ta.obv(df['close'], volume)
+        df['TREND_STRENGTH'] = df['ADX'].fillna(0)
+        df['MOMENTUM_SCORE'] = df['RSI'].fillna(50) / 100
+    except Exception as e:
+        logger.error(f"Indicator error: {str(e)}")
+    df = df.ffill().bfill()
+    return df
 
-# -------------------------------
-# News Impact Filtering
-# -------------------------------
-def filter_news_headline(headline):
-    impact_keywords = ["crash", "collapse", "bankruptcy", "recession", "downgrade", "rate hike"]
-    headline_lower = headline.lower()
-    if any(keyword in headline_lower for keyword in impact_keywords):
-        return headline, True
-    return headline, False
+# ---------------- Feature Engineering ----------------
+def prepare_features(df: pd.DataFrame, model_type: str):
+    try:
+        features = df[['close', 'RSI', 'MACD_12_26_9', 'BBU_20_2.0', 
+                       'BBL_20_2.0', 'ATR', 'ADX', 'TREND_STRENGTH']].dropna()
+        if model_type == "ml":
+            return features.tail(10).values.flatten().reshape(1, -1)
+        elif model_type == "dl":
+            return features.tail(100).values.reshape(1, 100, 8)
+        elif model_type == "rl":
+            return features.tail(1).values.reshape(1, -1)
+    except Exception as e:
+        logger.error(f"Feature engineering error: {str(e)}")
+        return None
 
-# -------------------------------
-# Telegram Messaging Function
-# -------------------------------
+# ---------------- Prediction Generation ----------------
+def generate_institutional_predictions(df: pd.DataFrame) -> dict:
+    predictions = {}
+    try:
+        ml_data = prepare_features(df, "ml")
+        dl_data = prepare_features(df, "dl")
+        rl_data = prepare_features(df, "rl")
+        for model in ["lstm", "gru", "transformer", "cnn"]:
+            if model in models and dl_data is not None:
+                try:
+                    predictions[model] = float(models[model].predict(dl_data)[0][0])
+                except Exception as e:
+                    logger.error(f"{model} prediction failed: {str(e)}")
+        for model in ["xgb", "lightgbm", "catboost", "svr", "stacking", "gaussian"]:
+            if model in models and ml_data is not None:
+                try:
+                    if model == "lightgbm":
+                        pred = models[model].predict(ml_data, predict_disable_shape_check=True)
+                    else:
+                        pred = models[model].predict(ml_data)
+                    predictions[model] = float(pred[0])
+                except Exception as e:
+                    if model == "xgb":
+                        logger.error(f"{model} prediction skipped due to error: {str(e)}")
+                    else:
+                        logger.error(f"{model} prediction failed: {str(e)}")
+        for model in ["dqn", "ppo"]:
+            if model in models and rl_data is not None:
+                try:
+                    action, _ = models[model].predict(rl_data)
+                    predictions[model] = float(action[0])
+                except Exception as e:
+                    logger.error(f"{model} prediction failed: {str(e)}")
+        if "prophet" in models and not df.empty:
+            try:
+                prophet_df = df[['timestamp', 'close']].rename(columns={'timestamp': 'ds', 'close': 'y'})
+                future = models["prophet"].make_future_dataframe(periods=1, freq='min')
+                forecast = models["prophet"].predict(future)
+                predictions["prophet"] = forecast['yhat'].iloc[-1]
+            except Exception as e:
+                logger.error(f"Prophet prediction failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Prediction generation error: {str(e)}")
+    return predictions
+
+# ---------------- Trade Level Computation ----------------
+def compute_trade_levels(price: float, atr: float, side: str) -> Tuple[float, List[float]]:
+    if side == "BUY":
+        stop_loss = price - 1.5 * atr
+        tps = [price + 1.5 * atr, price + 3 * atr, price + 4.5 * atr]
+    else:
+        stop_loss = price + 1.5 * atr
+        tps = [price - 1.5 * atr, price - 3 * atr, price - 4.5 * atr]
+    return stop_loss, tps
+
+# ---------------- Signal Generation ----------------
+def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: str) -> dict:
+    price = df["close"].iloc[-1] if not df.empty else 0
+    try:
+        atr = df["ATRr_14"].iloc[-1] if "ATRr_14" in df.columns else 0.0
+    except Exception:
+        atr = 0.0
+    signal = {
+        "asset": asset,
+        "action": "HOLD",
+        "price": price,
+        "confidence": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+        "indicators": {
+            "RSI": df["RSI_14"].iloc[-1] if "RSI_14" in df.columns else None,
+            "ATR": atr,
+            "Trend Strength": df["TREND_STRENGTH"].iloc[-1] if "TREND_STRENGTH" in df.columns else None
+        },
+        "predictions": predictions,
+        "news_sentiment": "NEUTRAL",
+        "tp_levels": [],
+        "sl_level": None,
+        "trade_mode": None
+    }
+    try:
+        valid_preds = [p for p in predictions.values() if not np.isnan(p)]
+        if len(valid_preds) < 3:
+            return signal
+        prediction_avg = sum(valid_preds) / len(valid_preds)
+        price_diff = prediction_avg - price
+        risk_ratio = abs(price_diff) / atr if atr > 0 else 0
+        base_confidence = risk_ratio * 100 if risk_ratio < 0.5 else 50 + (risk_ratio - 0.5) * 100
+        consensus_std = np.std(valid_preds)
+        consensus_factor = 1 - min(consensus_std / (abs(prediction_avg) + 1e-5), 1)
+        confidence = min(100, base_confidence * consensus_factor)
+        if price_diff > 0:
+            signal["action"] = "BUY"
+            signal["confidence"] = confidence
+        elif price_diff < 0:
+            signal["action"] = "SELL"
+            signal["confidence"] = confidence
+        if signal["action"] in ["BUY", "SELL"] and atr > 0:
+            sl, tps = compute_trade_levels(price, atr, signal["action"])
+            signal["sl_level"] = sl
+            signal["tp_levels"] = tps
+    except Exception as e:
+        logger.error(f"Signal generation error: {str(e)}")
+    return signal
+
+# ---------------- Trading Hours Logic ----------------
+def is_forex_trading_hours() -> bool:
+    now = datetime.utcnow().time()
+    start = dt_time(8, 0, 0)
+    end = dt_time(17, 0, 0)
+    return start <= now <= end
+
+def get_asset_universe() -> Dict[str, List[str]]:
+    global trading_mode_override
+    if trading_mode_override:
+        if trading_mode_override.upper() == "FOREX":
+            return {"forex": ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"]}
+        elif trading_mode_override.upper() == "CRYPTO":
+            return {"crypto": ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD", "ADA/USD"]}
+    if is_forex_trading_hours():
+        return {"forex": ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"]}
+    else:
+        return {"crypto": ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD", "ADA/USD"]}
+
+# ---------------- Telegram Messaging Helper ----------------
 def send_telegram_message(message: str, to_channel: bool = False):
     chat_id = TELEGRAM_CHANNEL_ID if to_channel else TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -595,7 +616,7 @@ def send_telegram_message(message: str, to_channel: bool = False):
         try:
             response = requests.post(url, json=payload)
             if response.status_code == 200:
-                logging.debug(f"Message sent to {'Channel' if to_channel else 'Bot'}.")
+                logging.debug(f"Message sent to {'Channel' if to_channel else 'Group'}.")
                 return
             elif response.status_code == 429:
                 retry_after = response.json().get("parameters", {}).get("retry_after", 2)
@@ -608,112 +629,10 @@ def send_telegram_message(message: str, to_channel: bool = False):
             logging.error(f"Exception while sending message: {e}")
             time.sleep(2)
 
-# -------------------------------
-# Economic Indicator Integration (Alpha Vantage)
-# -------------------------------
-def get_economic_indicators(function="GDP"):
-    url = "https://www.alphavantage.co/query"
-    params = {"function": function, "apikey": ALPHAVANTAGE_API_KEY}
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        return response.json()
-    except Exception as e:
-        logging.error(f"Error fetching economic indicators: {e}")
-        return {}
+# ---------------- Telegram Command Handlers ----------------
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
 
-# -------------------------------
-# WebSocket Endpoint for Real-Time Updates
-# -------------------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connected_clients.append(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except Exception as e:
-        logging.error(f"WebSocket error: {e}")
-    finally:
-        if websocket in connected_clients:
-            connected_clients.remove(websocket)
-
-async def broadcast_trade(trade_message: str):
-    for client in connected_clients:
-        try:
-            await client.send_text(trade_message)
-        except Exception as e:
-            logging.error(f"Error sending to client: {e}")
-
-# -------------------------------
-# Live Data & Indicator Functions
-# -------------------------------
-from fetch_live_prices import get_live_forex_prices
-from news_fetcher import get_forex_news
-
-# -------------------------------
-# Meta-Learning Module
-# -------------------------------
-from meta_learning import MetaLearningAgent
-meta_agent = MetaLearningAgent()
-
-# -------------------------------
-# User Feedback Storage
-# -------------------------------
-feedback_list = []
-
-class Feedback(BaseModel):
-    signal_id: str
-    rating: int
-    comment: str = None
-
-@app.post("/feedback")
-def submit_feedback(feedback: Feedback):
-    feedback_entry = {
-        "signal_id": feedback.signal_id,
-        "rating": feedback.rating,
-        "comment": feedback.comment,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    feedback_list.append(feedback_entry)
-    logging.debug(f"Feedback received: {feedback_entry}")
-    return {"message": "Feedback received", "data": feedback_entry}
-
-@app.get("/feedback")
-def get_feedback():
-    return {"feedback": feedback_list}
-
-# -------------------------------
-# Format Trade Signal Message with Futuristic Styling
-# -------------------------------
-def format_trade_signal(signal_details: Dict[str, Any]) -> str:
-    message = (
-        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-        "┃ 🚀 **NekoAIBot Trade Signal** 🚀 ┃\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        f"**Signal ID:** `{signal_details.get('signal_id')}`\n"
-        f"**Pair:** `{signal_details.get('pair')}`\n"
-        f"**Predicted Change:** `{signal_details.get('predicted_change')}`\n"
-        f"**News Sentiment:** `{signal_details.get('news_sentiment')}`\n"
-        f"**AI Signal:** `{signal_details.get('signal')}`\n"
-        f"**Confidence:** `{signal_details.get('confidence')}%`\n\n"
-        f"**Entry:** `{signal_details.get('entry_price')}`\n"
-        f"**Stop Loss:** `{signal_details.get('stop_loss')}`\n"
-        "——————————————\n"
-        "**Take Profits:**\n"
-        f"  • **TP1:** `{signal_details.get('TP1')}`\n"
-        f"  • **TP2:** `{signal_details.get('TP2')}`\n"
-        f"  • **TP3:** `{signal_details.get('TP3')}`\n"
-        f"  • **TP4:** `{signal_details.get('TP4')}`\n\n"
-        "⚠️ *Risk Warning: Trading involves significant risk. Manage your risk accordingly.*\n\n"
-        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-        "┃   **NekoAIBot - Next-Gen Trading**   ┃\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
-    )
-    return message
-
-# -------------------------------
-# Telegram Command Handlers (Async)
-# -------------------------------
 async def start_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         requests.post("http://127.0.0.1:8080/start_signals")
@@ -734,298 +653,246 @@ async def switch_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         parts = update.message.text.split()
         if len(parts) < 2:
-            await update.message.reply_text("Usage: /switch_mode <forex|crypto>", parse_mode="Markdown")
+            await update.message.reply_text("Usage: /mode <forex|crypto|auto>", parse_mode="Markdown")
             return
         mode = parts[1].lower()
-        if mode not in ["forex", "crypto"]:
-            await update.message.reply_text("Invalid mode. Use 'forex' or 'crypto'.", parse_mode="Markdown")
+        if mode not in ["forex", "crypto", "auto"]:
+            await update.message.reply_text("Invalid mode. Use 'forex', 'crypto', or 'auto'.", parse_mode="Markdown")
             return
         requests.post(f"http://127.0.0.1:8080/switch_mode?mode={mode}")
-        await update.message.reply_text(f"🔔 Mode switched manually to **{mode.upper()}**", parse_mode="Markdown")
+        await update.message.reply_text(f"🔔 Trading mode switched manually to **{mode.upper()}**", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error switching mode: {e}", parse_mode="Markdown")
 
-# New Command: Execute Trade via Telegram
-async def execute_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Telegram Webhook for Commands ----------------
+@app.post("/telegram_webhook")
+async def telegram_webhook(request: Request):
+    global signal_generation_active, trading_mode_override, manual_mode
+    data = await request.json()
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id", "")
+    logger.info(f"Received Telegram command from chat {chat_id}: {text}")
+    response_text = "Command not recognized. Available commands: /start_signals, /stop_signals, /mode <forex|crypto|auto>"
+    if text.startswith("/start_signals"):
+        signal_generation_active = True
+        response_text = "✅ Signal generation started via Telegram!"
+    elif text.startswith("/stop_signals"):
+        signal_generation_active = False
+        response_text = "🛑 Signal generation stopped via Telegram!"
+    elif text.startswith("/mode"):
+        parts = text.split()
+        if len(parts) >= 2:
+            mode = parts[1].lower()
+            if mode in ["forex", "crypto"]:
+                trading_mode_override = mode
+                manual_mode = mode
+                response_text = f"🔔 Trading mode overridden to {mode.upper()}."
+            elif mode == "auto":
+                trading_mode_override = None
+                manual_mode = None
+                response_text = "🔔 Trading mode set to automatic (time-based)."
+            else:
+                response_text = "Invalid mode. Use '/mode forex', '/mode crypto', or '/mode auto'."
     try:
-        parts = update.message.text.split()
-        if len(parts) < 2:
-            await update.message.reply_text("Usage: /execute_trade <signal_id>", parse_mode="Markdown")
-            return
-        signal_id = parts[1].strip()
-        # Try to find the trade signal by ID (check active_trades first, then historical)
-        trade_details = active_trades.get(signal_id)
-        if not trade_details:
-            trade_details = next((t for t in historical_trades if t.get("signal_id") == signal_id), None)
-        if not trade_details:
-            await update.message.reply_text(f"Trade signal {signal_id} not found.", parse_mode="Markdown")
-            return
-        if mt5 is None:
-            await update.message.reply_text("MT5 module not available. Cannot execute trade.", parse_mode="Markdown")
-            return
-        symbol = trade_details.get("pair")
-        order_type = trade_details.get("signal")
-        last_price = trade_details.get("entry_price")
-        volume = 0.1  # default lot size
-        sl = trade_details.get("stop_loss")
-        tp = trade_details.get("TP4")  # Using TP4 as target
-        result = place_mt5_order(symbol, order_type, volume, last_price, sl, tp, signal_id)
-        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-            await update.message.reply_text(f"Trade {signal_id} executed successfully.", parse_mode="Markdown")
-        else:
-            error_message = result.comment if result is not None else "Unknown error"
-            await update.message.reply_text(f"Trade {signal_id} failed to execute: {error_message}", parse_mode="Markdown")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"}
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json=payload)
     except Exception as e:
-        await update.message.reply_text(f"Error executing trade: {e}", parse_mode="Markdown")
+        logger.error(f"Error sending Telegram command response: {str(e)}")
+    return {"status": "ok"}
 
-# -------------------------------
-# Schedule Telegram Polling on FastAPI Startup
-# -------------------------------
-@app.on_event("startup")
+# ---------------- Telegram Polling Listener ----------------
 async def start_telegram_listener():
+    from telegram.ext import Application as TGApplication, CommandHandler
     application = TGApplication.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start_signals", start_signals_command))
     application.add_handler(CommandHandler("stop_signals", stop_signals_command))
-    application.add_handler(CommandHandler("switch_mode", switch_mode_command))
-    application.add_handler(CommandHandler("execute_trade", execute_trade_command))
-    async def polling_task():
-        try:
-            await application.run_polling()
-        except RuntimeError as e:
-            if "Cannot close a running event loop" in str(e):
-                logging.warning("Telegram polling attempted to close the event loop; ignoring.")
-            else:
-                raise
-    asyncio.create_task(polling_task())
-    logging.info("Telegram command listener started.")
-
-# -------------------------------
-# HTTP Endpoints for Signal Control
-# -------------------------------
-@app.post("/start_signals")
-def start_signals():
-    global signal_generation_active
-    signal_generation_active = True
-    send_telegram_message("✅ Signal generation started via API!", to_channel=False)
-    return {"message": "Signal generation started"}
-
-@app.post("/stop_signals")
-def stop_signals():
-    global signal_generation_active
-    signal_generation_active = False
-    send_telegram_message("🛑 Signal generation stopped via API!", to_channel=False)
-    return {"message": "Signal generation stopped"}
-
-@app.post("/switch_mode")
-def switch_mode(mode: str):
-    mode = mode.lower()
-    if mode not in ["forex", "crypto"]:
-        raise HTTPException(status_code=400, detail="Invalid mode. Must be 'forex' or 'crypto'.")
-    global last_trading_mode, manual_mode_override, manual_mode
-    manual_mode_override = True
-    manual_mode = mode
-    last_trading_mode = mode
-    send_telegram_message(f"🔔 Trading mode switched manually to **{mode.upper()}**", to_channel=True)
-    return {"message": f"Mode switched to {mode}"}
-
-# -------------------------------
-# Additional Global Variables for Risk/Reward
-# -------------------------------
-user_risk_reward_ratio = 0.5  # Default risk-reward ratio (SL:TP ratio)
-
-@app.post("/set_risk_reward")
-def set_risk_reward(ratio: float, current_user: dict = Depends(get_current_user)):
-    global user_risk_reward_ratio
-    if ratio <= 0 or ratio > 1:
-        raise HTTPException(status_code=400, detail="Risk-reward ratio must be between 0 and 1.")
-    user_risk_reward_ratio = ratio
-    return {"message": f"Risk-reward ratio updated to {ratio}."}
-
-@app.post("/set_execution_mode")
-def set_execution_mode(execute: bool, current_user: dict = Depends(get_current_user)):
-    global monitor_only_mode
-    monitor_only_mode = not execute
-    mode_str = "execution" if execute else "monitor-only"
-    send_telegram_message(f"🔄 Mode updated: Now in {mode_str} mode.", to_channel=True)
-    return {"message": f"Execution mode set to {mode_str}."}
-
-# -------------------------------
-# Live Signal Worker: Trading, Monitoring, and Updates
-# -------------------------------
-def live_signal_worker():
-    global signal_counter, signal_generation_active, last_news_update, last_trading_mode, total_loss_today, current_day, last_signal_time
-    current_day = datetime.now().date()
-    while True:
-        if not signal_generation_active:
-            logging.info("Signal generation is paused.")
-            time.sleep(10)
-            continue
-
-        today = datetime.now().date()
-        if today != current_day:
-            total_loss_today = 0.0
-            current_day = today
-
-        if not manual_mode_override:
-            est = pytz.timezone("US/Eastern")
-            now_est = datetime.now(est).time()
-            session_start = dt_time(5, 0)
-            session_end = dt_time(22, 0)
-            if session_start <= now_est <= session_end:
-                assets = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"]
-                mode = "forex"
-            else:
-                assets = ["BTC/USD", "ETH/USD", "XRP/USD"]
-                mode = "crypto"
+    application.add_handler(CommandHandler("mode", switch_mode_command))
+    try:
+        await application.run_polling()
+    except RuntimeError as e:
+        if "Cannot close a running event loop" in str(e):
+            logger.warning("Telegram polling attempted to close the event loop; ignoring.")
         else:
-            if manual_mode == "crypto":
-                assets = ["BTC/USD", "ETH/USD", "XRP/USD"]
-                mode = "crypto"
-            else:
-                assets = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"]
-                mode = "forex"
+            raise
 
-        if last_trading_mode is None:
-            last_trading_mode = mode
-        elif mode != last_trading_mode:
-            mode_switch_message = f"🔔 Trading Mode Change Alert:\nSwitched from **{last_trading_mode.upper()}** to **{mode.upper()}**."
-            send_telegram_message(mode_switch_message, to_channel=True)
-            last_trading_mode = mode
+# ---------------- Trading Execution Worker ----------------
+async def premium_trading_worker():
+    asset_universe = {
+        "forex": ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"],
+        "crypto": ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD", "ADA/USD"]
+    }
+    
+    if not initialize_mt5():
+        logger.error("MT5 initialization failed. Trading will not proceed.")
+    
+    asyncio.create_task(monitor_trades())
+    
+    while signal_generation_active:
+        start_time = time.time()
+        for asset_type, assets in asset_universe.items():
+            for asset in assets:
+                try:
+                    logger.info(f"Fetching market data for {asset} ({asset_type})")
+                    df = await fetch_market_data(asset, asset_type)
+                    if df is None or df.empty:
+                        continue
+                    df = compute_professional_indicators(df)
+                    if df.empty:
+                        continue
+                    predictions = generate_institutional_predictions(df)
+                    signal = generate_institutional_signal(df, predictions, asset)
+                    signal["trade_mode"] = "CRYPTO" if asset_type == "crypto" else "FOREX"
+                    news = await fetch_market_news(asset_type)
+                    signal["news_sentiment"] = analyze_sentiment(news)
+                    
+                    if signal["action"] != "HOLD" and signal["confidence"] > 65:
+                        await send_pre_signal_message(signal)
+                        await asyncio.sleep(30)
+                        order_volume = 0.1
+                        mt5_result = place_mt5_order(
+                            symbol=asset,
+                            order_type=signal["action"],
+                            volume=order_volume,
+                            price=signal["price"],
+                            sl=signal["sl_level"],
+                            tp=signal["tp_levels"][0],
+                            signal_id="Auto"
+                        )
+                        logger.info(f"MT5 order result for {asset}: {mt5_result}")
+                        with SessionLocal() as db:
+                            db_signal = TradeSignal(
+                                asset=signal["asset"],
+                                signal=signal["action"],
+                                price=signal["price"],
+                                confidence=signal["confidence"],
+                                tp_levels=signal["tp_levels"],
+                                sl_level=signal["sl_level"],
+                                indicators=signal["indicators"],
+                                predictions=signal["predictions"],
+                                news_sentiment=signal["news_sentiment"]
+                            )
+                            db.add(db_signal)
+                            db.commit()
+                            db.refresh(db_signal)
+                            signal["id"] = db_signal.id
+                        logger.info(f"Stored signal for {asset} with ID {signal['id']}.")
+                        await send_telegram_alert(signal)
+                    else:
+                        logger.info(f"No valid signal for {asset} (action: {signal['action']}, confidence: {signal['confidence']}).")
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Asset processing error for {asset}: {str(e)}")
+                    continue
+        elapsed = time.time() - start_time
+        logger.info(f"Worker cycle completed in {elapsed:.2f} seconds.")
+        await asyncio.sleep(max(0, 60 - elapsed))
 
-        logging.info(f"Trading mode: {mode}")
+# ---------------- Telegram Messaging: Pre-Signal and Final Signal ----------------
+async def send_pre_signal_message(signal: dict):
+    message = (
+        "🤖✨ **AlphaTrader Pre-Signal Notification** ✨🤖\n"
+        f"Trade Mode: {signal.get('trade_mode', 'N/A')}\n"
+        f"Asset: {signal['asset']}\n"
+        f"Action: {signal['action']}\n"
+        f"Price: {signal['price']:.5f}\n"
+        "⚠️ **Risk Warning:** Extreme market volatility ahead. Final confirmation in 30 seconds...\n"
+        "— NekoAITrader"
+    )
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": message, "parse_mode": "Markdown"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status != 200:
+                    logger.error(f"Pre-signal Telegram API error {response.status}: {await response.text()}")
+                else:
+                    logger.info(f"Pre-signal message sent to channel {TELEGRAM_CHANNEL_ID}.")
+    except Exception as e:
+        logger.error(f"Pre-signal Telegram error: {str(e)}")
 
-        for asset in assets:
-            if not signal_generation_active:
-                break
+async def send_telegram_alert(signal: dict):
+    if signal["confidence"] < 65:
+        logger.info("Signal confidence below threshold; alert not sent.")
+        return
+    if not TELEGRAM_BOT_TOKEN or not (TELEGRAM_CHAT_ID and TELEGRAM_CHANNEL_ID):
+        logger.error("Telegram credentials not set; cannot send alert.")
+        return
+    predicted_move = 0.0
+    if "lightgbm" in signal.get("predictions", {}):
+        predicted_move = signal["predictions"]["lightgbm"] - signal["price"]
+    message = (
+        "🚀 **Premium Trade Signal** 🚀\n"
+        f"Signal ID: {signal.get('id', 'N/A')}\n"
+        f"Trade Mode: {signal.get('trade_mode', 'N/A')}\n"
+        f"📈 {signal['asset']} | {signal['action']} | Confidence: {signal['confidence']:.1f}%\n"
+        f"💰 Price: {signal['price']:.5f}\n"
+        f"🔮 Predicted Move: {predicted_move:.5f}\n"
+        f"🛑 Stop Loss: {signal['sl_level']:.5f}\n"
+        f"🎯 Take Profits: {', '.join(map(lambda x: f'{x:.5f}', signal['tp_levels']))}\n"
+        "⚠️ **Risk Management Warning:** Please manage your risk appropriately.\n"
+        f"📰 Sentiment: {signal['news_sentiment']}"
+    )
+    for dest in [TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID]:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": dest, "text": message, "parse_mode": "Markdown"}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        logger.error(f"Telegram API error {response.status}: {await response.text()}")
+                    else:
+                        logger.info(f"Alert sent to destination: {dest}")
+        except Exception as e:
+            logger.error(f"Telegram error: {str(e)}")
 
-            if not can_send_signal(asset):
-                logging.info(f"Duplicate signal for {asset} suppressed.")
-                continue
+# ---------------- WebSocket Endpoint ----------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    while True:
+        try:
+            signal = signal_queue.get()
+            await websocket.send_json(signal)
+        except Exception as e:
+            logger.error(f"WebSocket error: {str(e)}")
+            break
 
-            prices, _ = get_extended_live_data(symbol=asset)
-            if prices is None or prices.shape[0] < 60:
-                logging.warning(f"Not enough price data for {asset}. Skipping...")
-                continue
+# ---------------- Additional Endpoints ----------------
+@app.get("/signals", response_model=List[dict])
+def get_signals(limit: int = 10):
+    with SessionLocal() as db:
+        signals = db.query(TradeSignal).order_by(TradeSignal.timestamp.desc()).limit(limit).all()
+        return [{
+            "asset": s.asset,
+            "signal": s.signal,
+            "price": s.price,
+            "confidence": s.confidence,
+            "timestamp": s.timestamp.isoformat(),
+            "tp_levels": s.tp_levels,
+            "sl_level": s.sl_level,
+            "indicators": s.indicators,
+            "predictions": s.predictions,
+            "news_sentiment": s.news_sentiment
+        } for s in signals]
 
-            logging.info(f"{asset} latest price: {prices[-1][0]}")
-            df_prices = pd.DataFrame(prices, columns=["close"])
-            df_prices = compute_indicators(df_prices)
-            df_prices = compute_custom_indicators(df_prices)
-            rsi_value = df_prices["RSI"].iloc[-1] if "RSI" in df_prices.columns else None
-            macd_value = df_prices["MACD_12_26_9"].iloc[-1] if "MACD_12_26_9" in df_prices.columns else None
-            bb_middle = df_prices["BBM_20_2.0"].iloc[-1] if "BBM_20_2.0" in df_prices.columns else None
-            atr_value = df_prices["ATR_14"].iloc[-1] if "ATR_14" in df_prices.columns else None
-            sma_20 = df_prices["SMA_20"].iloc[-1] if "SMA_20" in df_prices.columns else None
-            sma_50 = df_prices["SMA_50"].iloc[-1] if "SMA_50" in df_prices.columns else None
-            momentum = df_prices["Momentum"].iloc[-1] if "Momentum" in df_prices.columns else None
+@app.get("/feedback")
+def get_feedback():
+    return {"feedback": feedback_list}
 
-            logging.info(f"{asset} Indicators: RSI={rsi_value}, MACD={macd_value}, BBM={bb_middle}, ATR={atr_value}")
-
-            reshaped_data = prices.reshape(1, 60, 1)
-            lstm_pred = lstm_model.predict(reshaped_data)[0][0]
-            gru_pred = gru_model.predict(reshaped_data)[0][0]
-            xgb_pred = xgb_model.predict(prices.reshape(-1, 1))[-1]
-            logging.info(f"{asset} Predictions: LSTM={lstm_pred}, GRU={gru_pred}, XGB={xgb_pred}")
-            last_price = prices[-1][0]
-            predicted_change = round(abs(((lstm_pred + gru_pred + xgb_pred) / 3.0) - last_price), 5)
-
-            try:
-                headlines = get_forex_news()
-                news_headline = headlines[0] if headlines else "No news available."
-            except Exception as e:
-                logging.error(f"Error fetching news for {asset}: {e}")
-                news_headline = "No news available."
-            news_headline, impact_flag = filter_news_headline(news_headline)
-            if news_headline != last_news_update and news_headline != "No news available.":
-                send_telegram_message(f"📰 *News Update*: {news_headline}", to_channel=True)
-                last_news_update = news_headline
-
-            sentiment_result = sentiment_pipeline(news_headline)
-            sentiment_label = sentiment_result[0]["label"].upper() if sentiment_result else "NEUTRAL"
-
-            standard_value = standard_prediction(lstm_pred, gru_pred, xgb_pred)
-            final_signal = "BUY" if standard_value > 0.5 else "SELL"
-            if abs(standard_value - 0.5) < 0.05:
-                final_signal = "HOLD"
-            strategy = (f"Strategy: {final_signal} - Standard Avg = {standard_value:.4f}\n"
-                        f"RSI: {rsi_value}, MACD: {macd_value}, BBM: {bb_middle}, ATR: {atr_value}\n"
-                        f"SMA20: {sma_20}, SMA50: {sma_50}, Momentum: {momentum}\n"
-                        f"Predicted Change: {predicted_change}")
-            confidence = random.randint(80, 100)
-
-            economic_data = get_economic_indicators("GDP")
-            if "data" in economic_data and len(economic_data["data"]) > 0:
-                gdp_value = economic_data["data"][0].get("value", "N/A")
-                strategy += f"\nGDP Indicator: {gdp_value}"
-
-            pre_signal_message = (
-                "⚠️ *Risk Alert:*\n"
-                "Market conditions indicate heightened risk.\n"
-                "Ensure proper risk management and position sizing before proceeding.\n"
-                "⏳ *Preparing to drop a trade signal in 30 seconds...*\n\n" + strategy
-            )
-            send_telegram_message(pre_signal_message, to_channel=True)
-            time.sleep(30)
-
-            if final_signal in ["BUY", "SELL"] and atr_value is not None:
-                TP1, TP2, TP3, TP4, SL = calculate_trade_parameters(last_price, final_signal, atr_value)
-            else:
-                TP1 = TP2 = TP3 = TP4 = SL = None
-
-            if final_signal not in ["BUY", "SELL"]:
-                final_signal = "HOLD"
-
-            # Always send the live trade signal message
-            send_telegram_message(f"📣 *Trade Signal:* {asset} - {final_signal} at {last_price:.5f}", to_channel=True)
-
-            signal_counter += 1
-            signal_id = f"SIG-{signal_counter:04d}"
-            signal_details = {
-                "signal_id": signal_id,
-                "pair": asset,
-                "predicted_change": predicted_change,
-                "news_sentiment": sentiment_label,
-                "signal": final_signal,
-                "confidence": confidence,
-                "entry_price": last_price,
-                "stop_loss": SL,
-                "TP1": TP1,
-                "TP2": TP2,
-                "TP3": TP3,
-                "TP4": TP4,
-                "timestamp": datetime.utcnow().isoformat(),
-                "mode": mode,
-                "strategy": strategy
-            }
-            formatted_message = format_trade_signal(signal_details) + "\n" + strategy
-            send_telegram_message(formatted_message, to_channel=True)
-            send_telegram_message(formatted_message, to_channel=False)
-            asyncio.run_coroutine_threadsafe(broadcast_trade(formatted_message), event_loop)
-            update_errors(last_price, lstm_pred, gru_pred, xgb_pred)
-            active_trades[signal_id] = signal_details
-            historical_trades.append(signal_details)
-            logging.info(f"Generated Signal for {asset} ({mode} mode): {signal_details}")
-            time.sleep(5)
-        time.sleep(60)
-
-# Start the live signal worker in a background thread
-live_thread = threading.Thread(target=live_signal_worker, daemon=True)
-live_thread.start()
-
-# -------------------------------
-# HTTP Endpoints for Dashboard & Monitoring
-# -------------------------------
-@app.get("/")
-def home():
-    return {"message": "NEKO AI Trading API is running!"}
-
-@app.get("/active_trades")
-def get_active_trades():
-    return active_trades
-
-@app.get("/historical_trades")
-def get_historical_trades():
-    return {"historical_trades": historical_trades}
+@app.post("/feedback")
+def submit_feedback(feedback: Feedback):
+    feedback_entry = {
+        "signal_id": feedback.signal_id,
+        "rating": feedback.rating,
+        "comment": feedback.comment,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    feedback_list.append(feedback_entry)
+    logger.debug(f"Feedback received: {feedback_entry}")
+    return {"message": "Feedback received", "data": feedback_entry}
 
 @app.get("/performance_metrics")
 def performance_metrics():
@@ -1059,17 +926,17 @@ def backtest():
         "losses": losses,
         "win_rate_percentage": round(win_rate, 2),
         "average_confidence": round(avg_confidence, 2),
-        "note": "This is a simplified backtest using BUY as win and SELL as loss."
+        "note": "Simplified backtest: BUY is win, SELL is loss."
     }
 
 @app.get("/risk_adjustments")
 def risk_adjustments():
     simulated_avg_atr = 0.0025
-    suggested_multiplier = 1.5
+    suggested_multiplier = SL_MULTIPLIER
     return {
         "simulated_average_atr": simulated_avg_atr,
         "suggested_stop_loss_multiplier": suggested_multiplier,
-        "note": "Use these parameters to adjust stop loss levels based on market volatility."
+        "note": "Adjust stop loss based on volatility."
     }
 
 @app.get("/position_sizing")
@@ -1083,48 +950,40 @@ def position_sizing(equity: float, risk_percent: float = 1.0):
         "risk_amount": round(risk_amount, 2),
         "simulated_average_atr": simulated_avg_atr,
         "recommended_position_size": round(recommended_position_size, 2),
-        "note": "This is a simplified calculation for dynamic position sizing."
+        "note": "Simplified position sizing."
     }
 
-# -------------------------------
-# Simple HTTP Endpoint for Sending a Test Trade Signal
-# -------------------------------
-def send_trade_signal(pair, signal, confidence):
-    message = f"🚀 AI Trade Signal 🚀\n\n" \
-              f"🔹 Pair: {pair}\n" \
-              f"🔹 Signal: {signal}\n" \
-              f"🔹 Confidence: {confidence:.2f}%\n\n" \
-              f"🔥 Executing Trade Now... 🔥"
-    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    response = requests.post(telegram_url, json=payload)
-    if response.status_code == 200:
-        print("[✅] Trade Signal Sent to Telegram!")
-    else:
-        print("[❌] Failed to Send Trade Signal:", response.json())
+@app.get("/predict")
+def predict():
+    try:
+        sample_input = np.random.random((1, 3))
+        predictions = {}
+        if "cnn" in models:
+            predictions["cnn"] = models["cnn"].predict(sample_input).tolist()
+        if "lightgbm" in models:
+            predictions["lightgbm"] = models["lightgbm"].predict(sample_input.reshape(1, -1)).tolist()
+        if "stacking" in models:
+            predictions["stacking"] = models["stacking"].predict(sample_input).tolist()
+        return {"status": "success", "predictions": predictions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def generate_trade_signal():
-    sample_input = np.random.random((1, 3))  # Replace with real market data
+# ---------------- Startup & Shutdown ----------------
+@app.on_event("startup")
+async def startup_event():
+    load_all_models()
+    asyncio.create_task(premium_trading_worker())
+    asyncio.create_task(start_telegram_listener())
+    asyncio.create_task(monitor_trades())
+    logger.info("NekoAI Premium Trader Active and Telegram command listener started.")
 
-    # AI Predictions
-    cnn_prediction = models["cnn"].predict(sample_input)[0][0] if "cnn" in models else None
-    lightgbm_prediction = models["lightgbm"].predict(sample_input.reshape(1, -1))[0] if "lightgbm" in models else None
-    stacking_prediction = models["stacking"].predict(sample_input)[0] if "stacking" in models else None
+@app.on_event("shutdown")
+async def shutdown_event():
+    global signal_generation_active
+    signal_generation_active = False
+    shutdown_mt5()
+    logger.info("NekoAI Premium Trader Shutdown")
 
-    # Calculate final signal (simple average; adjust as needed)
-    preds = [p for p in [cnn_prediction, lightgbm_prediction, stacking_prediction] if p is not None]
-    if preds:
-        final_score = sum(preds) / len(preds)
-    else:
-        final_score = 0.0
-
-    signal = "BUY" if final_score > 0.5 else "SELL"
-    confidence = abs(final_score - 0.5) * 200  # Confidence in %
-
-    print(f"[📈] AI Trade Signal: {signal} | Confidence: {confidence:.2f}%")
-    send_trade_signal(pair="EUR/USD", signal=signal, confidence=confidence)
-
-@app.get("/test_trade_signal")
-def test_trade_signal():
-    generate_trade_signal()
-    return {"message": "Trade signal generated and sent."}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080, reload=True)

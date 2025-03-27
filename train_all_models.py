@@ -1,4 +1,3 @@
-# train_all_models.py
 import os
 import numpy as np
 import pandas as pd
@@ -36,14 +35,12 @@ from prophet import Prophet
 import gym
 from stable_baselines3 import PPO, DQN, A2C, SAC
 
-# Import your custom trading environment
+# Import your custom trading environment and feature engineering module
 from trading_env import TradingEnv
-
-# Import your feature engineering module
 from preprocess_features import create_features_targets
 
 # =============================================================================
-# Utility: Load price data
+# Utility: Load Price Data
 # =============================================================================
 DATA_PATH = "data/forex_data_preprocessed.csv"
 def load_price_data():
@@ -60,8 +57,10 @@ def train_lstm():
     X, y = create_features_targets(data, window_size=10)
     X = X.reshape((X.shape[0], X.shape[1], 1))
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Use an Input layer rather than passing input_shape in first layer directly
     model = Sequential([
-        LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        tf.keras.Input(shape=(X_train.shape[1], X_train.shape[2])),
+        LSTM(50, return_sequences=True),
         Dropout(0.2),
         LSTM(50),
         Dropout(0.2),
@@ -71,12 +70,13 @@ def train_lstm():
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint("models/lstm_model.h5", monitor='val_loss', save_best_only=True, verbose=1),
+        ModelCheckpoint("models/lstm_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
     ]
     model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
               callbacks=callbacks, verbose=1)
-    print("LSTM model saved as models/lstm_model.h5")
+    model.save("models/lstm_model.keras")
+    print("LSTM model saved as models/lstm_model.keras")
 
 # ---------- B. GRU Model ----------
 def train_gru():
@@ -86,7 +86,8 @@ def train_gru():
     X = X.reshape((X.shape[0], X.shape[1], 1))
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     model = Sequential([
-        GRU(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        tf.keras.Input(shape=(X_train.shape[1], X_train.shape[2])),
+        GRU(50, return_sequences=True),
         Dropout(0.2),
         GRU(50),
         Dropout(0.2),
@@ -96,12 +97,13 @@ def train_gru():
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint("models/gru_model.h5", monitor='val_loss', save_best_only=True, verbose=1),
+        ModelCheckpoint("models/gru_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
     ]
     model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
               callbacks=callbacks, verbose=1)
-    print("GRU model saved as models/gru_model.h5")
+    model.save("models/gru_model.keras")
+    print("GRU model saved as models/gru_model.keras")
 
 # ---------- C. CNN Model ----------
 def train_cnn():
@@ -111,7 +113,8 @@ def train_cnn():
     X = X.reshape((X.shape[0], X.shape[1], 1))
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     model = Sequential([
-        Conv1D(32, kernel_size=3, activation='relu', input_shape=(X_train.shape[1], 1)),
+        tf.keras.Input(shape=(X_train.shape[1], 1)),
+        Conv1D(32, kernel_size=3, activation='relu'),
         MaxPooling1D(pool_size=2),
         Dropout(0.2),
         Conv1D(64, kernel_size=3, activation='relu'),
@@ -124,30 +127,27 @@ def train_cnn():
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint("models/cnn_model.h5", monitor='val_loss', save_best_only=True, verbose=1),
+        ModelCheckpoint("models/cnn_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
     ]
     model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
               callbacks=callbacks, verbose=1)
-    print("CNN model saved as models/cnn_model.h5")
+    model.save("models/cnn_model.keras")
+    print("CNN model saved as models/cnn_model.keras")
 
 # ---------- D. Transformer Model for Time Series ----------
 def train_transformer():
     print("\n===== Training Transformer Model =====")
-    # Use the same sliding-window features from price data
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
-    # For transformer, we need input shape (samples, timesteps, features)
     X = X.reshape((X.shape[0], X.shape[1], 1))
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Define a simple Transformer block
     input_layer = Input(shape=(X_train.shape[1], 1))
     attn_output = MultiHeadAttention(num_heads=2, key_dim=32)(input_layer, input_layer)
     attn_output = LayerNormalization(epsilon=1e-6)(attn_output + input_layer)
     ffn_output = Dense(64, activation="relu")(attn_output)
     ffn_output = Dense(1)(ffn_output)
-    # Global average pooling to convert to vector output
     gap = GlobalMaxPooling1D()(ffn_output)
     output_layer = Dense(1, activation="linear")(gap)
     transformer_model = Model(inputs=input_layer, outputs=output_layer)
@@ -155,16 +155,17 @@ def train_transformer():
     
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint("models/transformer_model.h5", monitor='val_loss', save_best_only=True, verbose=1),
+        ModelCheckpoint("models/transformer_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
     ]
     
     transformer_model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
                            callbacks=callbacks, verbose=1)
-    print("Transformer model saved as models/transformer_model.h5")
+    transformer_model.save("models/transformer_model.keras")
+    print("Transformer model saved as models/transformer_model.keras")
 
 # =============================================================================
-# 2. Sentiment Model (Using sentiment_data.csv)
+# 2. Sentiment Model (Using sentiment_data.csv) – Faster Version
 # =============================================================================
 def train_sentiment():
     print("\n===== Training Sentiment Model =====")
@@ -174,33 +175,41 @@ def train_sentiment():
     df = pd.read_csv(sentiment_path)
     texts = df['text'].astype(str).values
     labels = df['sentiment'].values
-    max_words = 5000
-    max_len = 100
+
+    # Reduce complexity: smaller vocab and shorter sequences
+    max_words = 3000
+    max_len = 80
+
     tokenizer = Tokenizer(num_words=max_words)
     tokenizer.fit_on_texts(texts)
     sequences = tokenizer.texts_to_sequences(texts)
     X = pad_sequences(sequences, maxlen=max_len)
     y = labels
+
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
     model = Sequential([
-        Embedding(input_dim=max_words, output_dim=128, input_length=max_len),
-        LSTM(128, return_sequences=True),
-        Dropout(0.5),
+        tf.keras.Input(shape=(max_len,)),
+        Embedding(input_dim=max_words, output_dim=64),
+        LSTM(64, return_sequences=True),
+        Dropout(0.4),
         GlobalMaxPooling1D(),
-        Dense(64, activation='relu'),
-        Dropout(0.5),
+        Dense(32, activation='relu'),
+        Dropout(0.4),
         Dense(1, activation='sigmoid')
     ])
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint("models/sentiment_model.h5", monitor='val_loss', save_best_only=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+        EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/sentiment_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1)
     ]
-    model.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_val, y_val),
+    # Train for fewer epochs to speed up training
+    model.fit(X_train, y_train, epochs=10, batch_size=64, validation_data=(X_val, y_val),
               callbacks=callbacks, verbose=1)
     joblib.dump(tokenizer, "models/sentiment_tokenizer.pkl")
-    print("Sentiment model saved as models/sentiment_model.h5")
+    model.save("models/sentiment_model.keras")
+    print("Sentiment model saved as models/sentiment_model.keras")
     print("Sentiment tokenizer saved as models/sentiment_tokenizer.pkl")
 
 # =============================================================================
@@ -223,22 +232,23 @@ def train_anomaly():
     data = load_price_data()
     prices = data['close'].values.reshape(-1, 1)
     window_size = 10
-    X = [prices[i:i+window_size].flatten() for i in range(len(prices)-window_size)]
+    X = [prices[i:i+window_size].flatten() for i in range(len(prices) - window_size)]
     X = np.array(X)
     X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
     input_dim = X_train.shape[1]
     encoding_dim = 5
     autoencoder = Sequential([
-        Dense(encoding_dim, activation='relu', input_shape=(input_dim,)),
+        tf.keras.Input(shape=(input_dim,)),
+        Dense(encoding_dim, activation='relu'),
         Dense(input_dim, activation='linear')
     ])
     autoencoder.compile(optimizer='adam', loss='mse')
     autoencoder.fit(X_train, X_train, epochs=50, batch_size=32, validation_data=(X_val, X_val), verbose=1)
-    autoencoder.save("models/anomaly_model.h5")
-    print("Anomaly model saved as models/anomaly_model.h5")
+    autoencoder.save("models/anomaly_model.keras")
+    print("Anomaly model saved as models/anomaly_model.keras")
 
 # =============================================================================
-# 5. Traditional ML Models: LightGBM, XGBoost, CatBoost, SVR, Gaussian Process
+# 5. Traditional ML Models: LightGBM, XGBoost, CatBoost, SVR, Gaussian Process, Stacking
 # =============================================================================
 def train_lightgbm():
     print("\n===== Training LightGBM Model =====")
@@ -255,9 +265,7 @@ def train_lightgbm():
         'num_leaves': 31,
         'verbose': -1
     }
-    lgb_model = lgb.train(params,
-                          train_data,
-                          num_boost_round=200,
+    lgb_model = lgb.train(params, train_data, num_boost_round=200,
                           valid_sets=[val_data],
                           callbacks=[lgb.early_stopping(stopping_rounds=20)])
     y_pred = lgb_model.predict(X_val, num_iteration=lgb_model.best_iteration)
@@ -305,6 +313,7 @@ def train_svm():
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    from sklearn.svm import SVR
     svr = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
     svr.fit(X_train, y_train)
     y_pred = svr.predict(X_val)
@@ -332,6 +341,8 @@ def train_stacking():
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+    from sklearn.linear_model import LinearRegression
     base_models = [
         ('rf', RandomForestRegressor(n_estimators=100, random_state=42))
     ]
@@ -354,7 +365,6 @@ def train_prophet():
     df_prophet = data[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
     m = Prophet()
     m.fit(df_prophet)
-    # Save the Prophet model using pickle
     with open("models/prophet_model.pkl", "wb") as f:
         pickle.dump(m, f)
     print("Prophet model saved as models/prophet_model.pkl")
@@ -388,7 +398,7 @@ def train_a2c():
 
 def train_sac():
     print("\n===== Training SAC Model =====")
-    env = TradingEnv()  # Note: SAC is designed for continuous action spaces; ensure your env supports this.
+    env = TradingEnv()  # Ensure your env supports continuous actions for SAC
     model = SAC("MlpPolicy", env, verbose=1)
     model.learn(total_timesteps=50000)
     model.save("models/sac_model")
@@ -399,10 +409,9 @@ def train_sac():
 # =============================================================================
 def train_gnn():
     print("\n===== Training Graph Neural Network Model =====")
-    print("GNN training requires specialized libraries (e.g., PyTorch Geometric or DGL) and is not implemented in this script.")
-    # You can implement a GNN model if your data contains relational information between assets.
-    # For now, this function is a placeholder.
-    
+    print("GNN training requires specialized libraries (e.g., PyTorch Geometric or DGL) and a dedicated data pipeline.")
+    print("This function is a placeholder. Implement GNN training when you have the appropriate dataset and libraries.")
+
 # =============================================================================
 # Main: Train all models in one go
 # =============================================================================

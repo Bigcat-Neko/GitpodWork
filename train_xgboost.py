@@ -1,46 +1,35 @@
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+#!/usr/bin/env python
 import os
-
-# Load the CSV data
-data = pd.read_csv("training_data.csv")
-
-# Ensure that we only work on non-gold assets if desired:
-data = data[data["asset"] != "XAU/USD"]
-
-# For this example, we create a simple feature:
-# Assume our target is the percentage change from current close to next close.
-data["close_shifted"] = data.groupby("asset")["close"].shift(-1)
-data.dropna(inplace=True)
-data["target"] = (data["close_shifted"] - data["close"]) / data["close"]
-
-# Use the 'close' price as the only feature for now.
-features = data[["close"]]
-target = data["target"]
-
-# Split into training and testing sets.
-X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-
-# Initialize and train the XGBoost model with small parameters for quick training.
-model = xgb.XGBRegressor(
-    objective="reg:squarederror",
-    n_estimators=50,      # Fewer trees for a quick training run.
-    learning_rate=0.1,
-    max_depth=3,          # Shallow trees for faster training.
-    random_state=42
-)
-
-model.fit(X_train, y_train)
-
-# Evaluate the model
-predictions = model.predict(X_test)
-mse = mean_squared_error(y_test, predictions)
-print(f"Test Mean Squared Error: {mse}")
-
-# Save the model to a file
-os.makedirs("models", exist_ok=True)
-model.save_model("models/xgboost_model.json")
-print("XGBoost model saved as models/xgboost_model.json")
+import numpy as np
+import pandas as pd
+import joblib
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from preprocess_features import create_features_targets
+DATA_PATH = "data/forex_data_preprocessed.csv"
+def load_price_data():
+    return pd.read_csv(DATA_PATH, parse_dates=["date", "fetched_at"])
+def train_xgboost():
+    print("\n===== Training XGBoost Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
+    params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'learning_rate': 0.05,
+        'max_depth': 6
+    }
+    evallist = [(dval, 'eval')]
+    xgb_model = xgb.train(params, dtrain, num_boost_round=200, evals=evallist, early_stopping_rounds=20)
+    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_ntree_limit)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("XGBoost Validation RMSE:", rmse)
+    xgb_model.save_model("models/xgboost_model.json")
+    print("XGBoost model saved as models/xgboost_model.json")
+if __name__ == "__main__":
+    os.makedirs("models", exist_ok=True)
+    train_xgboost()

@@ -4,66 +4,62 @@ import requests
 import pandas as pd
 from dotenv import load_dotenv
 
-# Load API keys from .env
-load_dotenv(override=True)
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+# Load environment variables from .env file
+load_dotenv()
 
-def fetch_data(symbol, interval="1h"):
-    """
-    Fetch historical market data from TwelveData API.
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
+if not API_KEY:
+    raise ValueError("TWELVEDATA_API_KEY not found in environment variables.")
 
-    Parameters:
-        symbol (str): Trading pair (e.g., "EURUSD" for Forex, "BTC/USD" for Crypto).
-        interval (str): Timeframe ("1min", "5min", "15min", "1h", "4h", "1day").
+# Define the symbols: Forex main pairs and common crypto pairs
+symbols = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",  # Forex
+    "BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"               # Cryptocurrencies
+]
 
-    Returns:
-        DataFrame: Processed historical data for backtesting.
-    """
-    base_url = "https://api.twelvedata.com/time_series"
-    
-    params = {
-        "symbol": symbol,  
-        "interval": interval,
-        "apikey": TWELVEDATA_API_KEY,
-        "outputsize": "5000",
-        "format": "json"
-    }
+# Base URL for TwelveData's time series endpoint
+base_url = "https://api.twelvedata.com/time_series"
 
-    response = requests.get(base_url, params=params).json()
-    
-    # Debugging: Print response to check API output
-    print(f"Fetching data for {symbol}")
-    print(response)
-
-    if "values" not in response:
-        raise ValueError(f"Unexpected API response: {response}")
-
-    # Convert API response to DataFrame
-    df = pd.DataFrame(response["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
-    df = df.astype(float)
-    df = df.sort_index()
-
-    return df
-
-# List of Forex & Crypto pairs (without slashes for Forex)
-forex_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "USD/CHF", "NZD/USD"]
-crypto_pairs = ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "ADA/USD", "BNB/USD", "DOGE/USD"]
-
-# Fetch and store data with a 10-second delay to avoid rate limits
+# Dictionary to store market data per symbol
 market_data = {}
 
-for pair in forex_pairs + crypto_pairs:
-    try:
-        market_data[pair] = fetch_data(pair, interval="1h")
-    except Exception as e:
-        print(f"Error fetching {pair}: {e}")
+# Loop through each symbol, fetch the data, and wait 10 seconds between calls
+for symbol in symbols:
+    print(f"Fetching data for {symbol} ...")
+    params = {
+        "symbol": symbol,
+        "interval": "1day",   # Change interval as needed
+        "outputsize": 30,     # Number of data points to retrieve; adjust as needed
+        "apikey": API_KEY
+    }
+    
+    response = requests.get(base_url, params=params)
+    data = response.json()
+    
+    if "values" in data:
+        market_data[symbol] = data["values"]
+        print(f"Data for {symbol} fetched successfully.")
+    else:
+        # Print error message if data isn't available (e.g., API rate limit reached)
+        error_msg = data.get("message", "Unknown error")
+        print(f"Error fetching data for {symbol}: {error_msg}")
+    
+    # Wait for 10 seconds before the next API call
+    time.sleep(10)
 
-    time.sleep(10)  # 10-second delay to avoid rate limits
+# Convert the fetched data into a pandas DataFrame.
+# Here, we create one DataFrame per symbol and then concatenate them along the columns.
+dfs = []
+for sym, values in market_data.items():
+    df = pd.DataFrame(values)
+    df["symbol"] = sym  # add a column to identify the symbol
+    dfs.append(df)
 
-# Print sample data
-for pair, df in market_data.items():
-    print(f"\n{pair} Data Sample:\n", df.head())
-
-# Now, this data can be used for backtesting.
+if dfs:
+    full_df = pd.concat(dfs, ignore_index=True)
+    # Save the combined DataFrame to CSV
+    output_path = "data/market_features.csv"
+    full_df.to_csv(output_path, index=False)
+    print(f"Saved market features for all symbols to {output_path}")
+else:
+    print("No market data fetched.")
