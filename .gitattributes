@@ -1,6 +1,5 @@
 # Set default behavior to automatically normalize line endings.
 * text=auto
-
 # Declare files that are truly binary so they’re not modified.
 *.png binary
 *.jpg binary
@@ -16,6 +15,7 @@ models/*.keras binary
 models/*.pkl binary
 models/*.cbm binary
 models/*.json binary
+data/sentiment140.zip filter=lfs diff=lfs merge=lfs -text
 data/sentiment_data.csv filter=lfs diff=lfs merge=lfs -text
 data/training.1600000.processed.noemoticon.csv filter=lfs diff=lfs merge=lfs -text
 models/sentiment_model.pkl filter=lfs diff=lfs merge=lfs -text
