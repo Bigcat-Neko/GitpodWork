@@ -88,3 +88,9 @@ celerybeat-schedule
 # IDE directories
 .vscode/
 .idea/
+
+# Ignore large data files
+data/sentiment140.zip
+data/sentiment_data.csv
+data/training.1600000.processed.noemoticon.csv
+models/sentiment_model.pkl

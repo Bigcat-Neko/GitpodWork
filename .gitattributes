@@ -19,3 +19,5 @@ data/sentiment140.zip filter=lfs diff=lfs merge=lfs -text
 data/sentiment_data.csv filter=lfs diff=lfs merge=lfs -text
 data/training.1600000.processed.noemoticon.csv filter=lfs diff=lfs merge=lfs -text
 models/sentiment_model.pkl filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text

@@ -1,82 +1,110 @@
-# trading_env.py
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
+import logging
+
+logger = logging.getLogger(__name__)
+
+def compute_ATR(prices, window=14):
+    # A simple ATR computation assuming prices is a 1-D array of close prices.
+    # In practice, ATR is computed from high, low, close.
+    # Here we use the absolute difference of consecutive close prices as a proxy.
+    diffs = np.abs(np.diff(prices))
+    if len(diffs) < window:
+        return np.mean(diffs) if diffs.size > 0 else 0.0
+    return pd.Series(diffs).rolling(window=window).mean().iloc[-1]
 
 class TradingEnv(gym.Env):
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
     
     def __init__(self, prices=None, window_size=10):
-        """
-        Parameters:
-            prices: Optional 1D numpy array of prices. If None, loads 'close' prices
-                    from 'data/forex_data_preprocessed.csv' and normalizes them between 0 and 1.
-            window_size: Number of past data points to use as observation.
-        """
-        super(TradingEnv, self).__init__()
+        super().__init__()
         self.window_size = window_size
         
-        # Load and normalize prices if not provided
+        # Load or generate price data.
         if prices is None:
-            df = pd.read_csv("data/forex_data_preprocessed.csv", parse_dates=["date", "fetched_at"])
-            prices = df["close"].values.reshape(-1, 1)
-            self.scaler = MinMaxScaler()
-            prices = self.scaler.fit_transform(prices).flatten()
+            try:
+                df = pd.read_csv("data/forex_data_preprocessed.csv", parse_dates=["date", "fetched_at"])
+                prices = df["close"].values.astype(np.float32)
+                self.scaler = MinMaxScaler()
+                prices = self.scaler.fit_transform(prices.reshape(-1, 1)).flatten()
+                logger.info("Loaded prices from data file")
+            except FileNotFoundError:
+                logger.warning("Data file not found, using generated data")
+                prices = np.random.rand(1000).astype(np.float32)
+                self.scaler = None
         else:
+            prices = np.array(prices).astype(np.float32)
             self.scaler = None
-            prices = np.array(prices)
-        self.prices = prices.astype(np.float32)
-        
+
+        self.prices = prices
         self.current_step = self.window_size
-        # Actions: 0 = Hold, 1 = Buy (long), 2 = Sell (short)
-        self.action_space = spaces.Discrete(3)
-        # Observations: the last 'window_size' normalized price values
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.window_size,), dtype=np.float32)
-        
-        self.position = 0  # 0 means no position, 1 means long, -1 means short
+        self.position = 0  # 0: Flat, 1: Long, -1: Short
         self.done = False
+        
+        # Here, we create an observation space that includes:
+        # - The window of normalized prices.
+        # - A simple moving average over the window.
+        # - The rolling ATR computed over the window.
+        self.observation_space = spaces.Box(
+            low=0.0, 
+            high=1.0, 
+            shape=(3 * self.window_size,), 
+            dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(3)  # 0=Hold, 1=Buy, 2=Sell
+
+    def _compute_indicators(self, window_prices):
+        # Compute a simple moving average
+        sma = np.mean(window_prices)
+        # Compute a proxy for ATR as the mean absolute difference
+        atr = np.mean(np.abs(np.diff(window_prices)))
+        return sma, atr
+
+    def _get_obs(self):
+        # Get the current window of prices.
+        window = self.prices[self.current_step - self.window_size:self.current_step]
+        # Compute indicators for this window.
+        sma, atr = self._compute_indicators(window)
+        # For simplicity, we return a concatenated vector: [prices, SMA repeated, ATR repeated]
+        obs = np.concatenate([window, np.full(self.window_size, sma), np.full(self.window_size, atr)])
+        return obs
 
     def reset(self, seed=None, options=None):
         self.current_step = self.window_size
         self.position = 0
         self.done = False
-        obs = self.prices[self.current_step - self.window_size:self.current_step]
+        obs = self._get_obs()
         return obs, {}
 
     def step(self, action):
         if self.done:
             return self.reset()
-        
-        # Calculate reward: change in price multiplied by the current position
-        previous_price = self.prices[self.current_step - 1]
+            
+        prev_price = self.prices[self.current_step - 1]
         current_price = self.prices[self.current_step]
-        reward = (current_price - previous_price) * self.position
+        # Reward is calculated as profit from the previous position.
+        reward = (current_price - prev_price) * self.position
         
-        # Update position based on action:
-        # Action 1 (Buy) sets position to 1, Action 2 (Sell) sets position to -1, Action 0 keeps the same position.
+        # Update position based on the action.
         if action == 1:
             self.position = 1
         elif action == 2:
             self.position = -1
-        
+        else:
+            # If hold, keep the current position.
+            pass
+            
         self.current_step += 1
-        if self.current_step >= len(self.prices):
-            self.done = True
+        self.done = self.current_step >= len(self.prices)
         
-        obs = self.prices[self.current_step - self.window_size:self.current_step]
+        obs = self._get_obs()
+        # Gymnasium step returns (observation, reward, terminated, truncated, info)
         return obs, reward, self.done, False, {}
 
     def render(self, mode="human"):
-        print(f"Step: {self.current_step}, Price: {self.prices[self.current_step]}, Position: {self.position}")
+        if mode == "human":
+            print(f"Step: {self.current_step}, Price: {self.prices[self.current_step]:.4f}, Position: {self.position}")
 
-if __name__ == "__main__":
-    # Simple test run of the environment
-    env = TradingEnv()
-    obs, _ = env.reset()
-    print("Initial observation:", obs)
-    for _ in range(5):
-        action = env.action_space.sample()
-        obs, reward, done, truncated, info = env.step(action)
-        env.render()
