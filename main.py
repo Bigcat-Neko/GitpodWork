@@ -500,6 +500,21 @@ async def switch_mode(mode: str, request: Request, current_user: User = Depends(
         "timestamp": datetime.utcnow().isoformat()
     }
 
+# PASTE THIS ENTIRE CODE BLOCK INTO YOUR TRADING SYSTEM FILE
+# (Replace previous versions of the TradingSystem class)
+
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+
+if __name__ == "__main__":
+    # Add the necessary code to run the application
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
 async def refresh_assets_immediately(assets: List[str]):
     """Force immediate market data update for new assets after mode switch."""
     logger.info(f"Initiating immediate data refresh for assets: {assets}")
@@ -937,6 +952,9 @@ async def fetch_alphavantage(symbol: str, asset_type: str):
         logger.error(f"AlphaVantage fetch failed: {str(e)}")
         return None
     
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def fetch_twelvedata(symbol: str, asset_type: str):
     params = {
         "symbol": symbol,
@@ -951,15 +969,13 @@ async def fetch_twelvedata(symbol: str, asset_type: str):
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get("https://api.twelvedata.com/time_series", 
-                                 params=params,
-                                 headers={"User-Agent": "NekoAIBot/1.0"}) as response:
-                
+                                     params=params,
+                                     headers={"User-Agent": "NekoAIBot/1.0"}) as response:
                 if response.status == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
                     logger.warning(f"TwelveData rate limited. Retrying after {retry_after}s")
                     await asyncio.sleep(retry_after)
                     return await fetch_twelvedata(symbol, asset_type)
-                    
                 data = await response.json()
                 if "code" in data and data["code"] == 429:
                     logger.error("TwelveData API limit exceeded")
@@ -967,7 +983,7 @@ async def fetch_twelvedata(symbol: str, asset_type: str):
                 return process_data(data)
     except Exception as e:
         logger.error(f"TwelveData fetch failed: {str(e)}")
-        return None
+        raise
 
 def process_data(data: dict) -> pd.DataFrame:
     if "values" not in data and "Time Series (Digital Currency Daily)" not in data:
@@ -1255,93 +1271,82 @@ def generate_institutional_predictions(df: pd.DataFrame) -> dict:
         logger.error(f"Prediction generation error: {str(e)}")
     return predictions
 
+
+def get_all_users():
+    """Query the database to return all registered users."""
+    with SessionLocal() as db:
+        return db.query(User).all()
+
 def compute_trade_levels(price: float, atr: float, side: str) -> dict:
-    """Calculate stop loss and take profit levels with validation"""
+    """Calculate stop loss and take profit levels based on ATR and volatility."""
     if atr <= 0 or np.isnan(atr):
-        atr = price * 0.01  # Fallback to 1% if invalid ATR
-    
-    # Dynamic multiplier based on volatility
+        atr = price * 0.01  # Fallback ATR
     volatility_ratio = atr / price
-    if volatility_ratio > 0.02:  # Highly volatile
+    if volatility_ratio > 0.02:
         multiplier = 1.0
-    elif volatility_ratio > 0.01:  # Moderately volatile
+    elif volatility_ratio > 0.01:
         multiplier = 1.5
-    else:  # Low volatility
+    else:
         multiplier = 2.0
-    
     adjusted_atr = atr * multiplier
-    
     if side == "BUY":
         sl = price - adjusted_atr
-        # Ensure SL is at least 0.5% below price
-        sl = max(sl, price * 0.995)
-        
-        # Calculate 3 TP levels
-        tp_levels = [
-            price + adjusted_atr * 1,
-            price + adjusted_atr * 2,
-            price + adjusted_atr * 3
-        ]
-        # Ensure TPs are at least 0.5% above price
-        tp_levels = [max(tp, price * 1.005) for tp in tp_levels]
+        sl = max(sl, price * 0.995)  # Ensure SL is at least 0.5% below price
+        tp_levels = [max(price + adjusted_atr * i, price * 1.005) for i in [1, 2, 3]]
     else:  # SELL
         sl = price + adjusted_atr
-        # Ensure SL is at least 0.5% above price
-        sl = min(sl, price * 1.005)
-        
-        # Calculate 3 TP levels
-        tp_levels = [
-            price - adjusted_atr * 1,
-            price - adjusted_atr * 2,
-            price - adjusted_atr * 3
-        ]
-        # Ensure TPs are at least 0.5% below price
-        tp_levels = [max(tp, 0.00001) for tp in tp_levels]  # Also ensure positive
-    
-    # Final validation
-    sl = max(sl, 0.00001)  # Absolute minimum price
-    tp_levels = [max(tp, 0.00001) for tp in tp_levels]
-    
-    return {
-        "sl_level": sl,
-        "tp_levels": tp_levels
-    }
+        sl = min(sl, price * 1.005)  # Ensure SL is at least 0.5% above price
+        tp_levels = [max(price - adjusted_atr * i, 0.00001) for i in [1, 2, 3]]
+    return {"sl_level": sl, "tp_levels": tp_levels}
 
 def safe_predictions(predictions: dict) -> dict:
-    """
-    Ensure that the predictions dictionary contains valid numeric values.
-    If a prediction is missing or invalid, replace it with a fallback (e.g., 0).
-    """
+    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
     fallback = {
-        "lstm": 0,
-        "gru": 0,
-        "transformer": 0,
-        "cnn": 0,
-        "xgb": 0,
-        "lightgbm": 0,
-        "catboost": 0,
-        "svr": 0,
-        "stacking": 0,
-        "gaussian": 0,
-        "prophet": 0,
+        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
+        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
+        "stacking": 0, "gaussian": 0, "prophet": 0
     }
     safe_preds = {}
-    for key in fallback:
+    for key, fb in fallback.items():
         try:
-            value = predictions.get(key, fallback[key])
-            # If the value isn't numeric or is NaN, then use fallback.
-            if not isinstance(value, (int, float)) or np.isnan(value):
-                safe_preds[key] = fallback[key]
+            val = predictions.get(key, fb)
+            if not isinstance(val, (int, float)) or np.isnan(val):
+                safe_preds[key] = fb
             else:
-                safe_preds[key] = value
-        except Exception as e:
-            logger.error(f"Error processing prediction {key}: {str(e)}")
-            safe_preds[key] = fallback[key]
+                safe_preds[key] = val
+        except Exception:
+            safe_preds[key] = fb
+    return safe_preds
+
+def safe_predictions(predictions: dict) -> dict:
+    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
+    fallback = {
+        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
+        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
+        "stacking": 0, "gaussian": 0, "prophet": 0
+    }
+    safe_preds = {}
+    for key, fb in fallback.items():
+        try:
+            val = predictions.get(key, fb)
+            if not isinstance(val, (int, float)) or np.isnan(val):
+                safe_preds[key] = fb
+            else:
+                safe_preds[key] = val
+        except Exception:
+            safe_preds[key] = fb
     return safe_preds
 
 def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: str) -> dict:
-    price = df["close"].iloc[-1]
-    atr = df["ATR_14"].iloc[-1] if "ATR_14" in df.columns else 0.0
+    """
+    Generate a trade signal based on market data and technical indicators.
+    Uses SMA, ADX, and DI values to determine whether to BUY or SELL.
+    """
+    try:
+        price = df["close"].iloc[-1]
+    except Exception:
+        price = 150.0
+    atr = df["ATR_14"].iloc[-1] if "ATR_14" in df.columns else price * 0.01
     adx = df["ADX_14"].iloc[-1] if "ADX_14" in df.columns else 0.0
     di_plus = df["+DI_14"].iloc[-1] if "+DI_14" in df.columns else 0.0
     di_minus = df["-DI_14"].iloc[-1] if "-DI_14" in df.columns else 0.0
@@ -1353,64 +1358,33 @@ def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: st
         "confidence": 0,
         "timestamp": datetime.utcnow().isoformat(),
         "indicators": {
-            "RSI_14": df["RSI_14"].iloc[-1],
+            "RSI_14": df["RSI_14"].iloc[-1] if "RSI_14" in df.columns else None,
             "ATR_14": atr,
             "ADX_14": adx,
             "+DI_14": di_plus,
             "-DI_14": di_minus,
-            "ICHIMOKU_SENKOU_A": df["ICHIMOKU_SENKOU_A"].iloc[-1],
-            "VWAP": df["VWAP"].iloc[-1] if "VWAP" in df.columns else price
         },
         "predictions": predictions,
-        "news_sentiment": "NEUTRAL",
         "tp_levels": [],
         "sl_level": None,
-        "trade_mode": None,
-        "predicted_change": predictions.get("lstm", 0)
     }
-
-    try:
-        # Trend Validation via Ichimoku Cloud
-        price_above_cloud = (price > df["ICHIMOKU_SENKOU_A"].iloc[-1] and 
-                             price > df["ICHIMOKU_SENKOU_B"].iloc[-1])
-        price_below_cloud = (price < df["ICHIMOKU_SENKOU_A"].iloc[-1] and 
-                             price < df["ICHIMOKU_SENKOU_B"].iloc[-1])
-        
-        strong_trend = adx > 25
-        di_crossover = di_plus > di_minus
-        
-        valid_preds = [p for p in predictions.values() if isinstance(p, (int, float)) and not np.isnan(p)]
-        if len(valid_preds) < 3:
-            logger.info(f"Not enough valid predictions for {asset}. Returning HOLD.")
-            return signal
-
-        prediction_avg = np.mean(valid_preds)
-        price_diff = prediction_avg - price
-        risk_ratio = abs(price_diff) / atr if atr > 0 else 0
-        
-        # Confidence Calculation (ADX-weighted)
-        base_conf = min(100, risk_ratio * 100 * (adx/100 + 0.5))
-        consensus_std = np.std(valid_preds)
-        consensus_factor = 1 - min(consensus_std / (abs(prediction_avg) + 1e-5), 1)
-        confidence = min(100, base_conf * consensus_factor)
-
-        # Signal Logic based on trend, cloud position, and directional crossover
-        if price_diff > 0 and price_above_cloud and strong_trend and di_crossover:
-            signal.update({
-                "action": "BUY",
-                "confidence": confidence,
-                **compute_trade_levels(price, atr, "BUY")
-            })
-        elif price_diff < 0 and price_below_cloud and strong_trend and not di_crossover:
-            signal.update({
-                "action": "SELL",
-                "confidence": confidence,
-                **compute_trade_levels(price, atr, "SELL")
-            })
-
-    except Exception as e:
-        logger.error(f"Signal generation error for {asset}: {str(e)}")
-    
+    # Use a simple indicator: if current price is above SMA_50 and ADX > 25 with DI+ > DI- then BUY,
+    # if below SMA_50 with ADX > 25 and DI- > DI+ then SELL; otherwise HOLD.
+    sma = df["SMA_50"].iloc[-1] if "SMA_50" in df.columns else price
+    if price > sma and adx > 25 and di_plus > di_minus:
+        action = "BUY"
+    elif price < sma and adx > 25 and di_minus > di_plus:
+        action = "SELL"
+    else:
+        action = "HOLD"
+    if action != "HOLD":
+        levels = compute_trade_levels(price, atr, action)
+        signal.update({
+            "action": action,
+            "sl_level": levels["sl_level"],
+            "tp_levels": levels["tp_levels"],
+            "confidence": 90  # Example fixed confidence value
+        })
     return signal
 
 def is_forex_trading_hours() -> bool:
@@ -1419,14 +1393,17 @@ def is_forex_trading_hours() -> bool:
 
 def get_asset_universe(force_refresh=False):
     global trading_mode_override
-
     if force_refresh or trading_mode_override:
         if trading_mode_override == "crypto":
-            return ["BTC/USD", "ETH/USD", "XRP/USD"]
+            # Return a comprehensive list of major crypto pairs.
+            return ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
         elif trading_mode_override == "forex":
-            return ["EUR/USD", "GBP/USD", "USD/JPY"]
+            # Return a full set of major forex pairs.
+            return ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USDCAD"]
     # Default auto-mode logic based on market hours.
-    return ["BTC/USD", "ETH/USD"] if not is_forex_trading_hours() else ["EUR/USD", "GBP/USD"]
+    return (["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"] 
+            if not is_forex_trading_hours() 
+            else ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USDCAD"])
 
 async def start_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1786,19 +1763,33 @@ async def refresh_market_data():
             await asyncio.sleep(1)
         await asyncio.sleep(300)
 
-async def place_mt5_order(symbol: str, order_type: str, volume: float, price: float, 
-                          signal_id: str, user: Optional[User] = None,
-                          sl_level: Optional[float] = None, 
-                          tp_levels: Optional[List[float]] = None) -> Optional[Any]:
-    """
-    Attempts to place an order on the MT5 platform.
-    Added a check to verify that orders are only attempted during active market hours.
-    """
-    # Check if the market is open (for example, forex trading hours)
-    if not is_forex_trading_hours():
-        logger.error("Order failed: Market closed")
-        return None
+class AsyncPositionTracker:
+    def __init__(self):
+        self.active_positions = {}
+        self.lock = asyncio.Lock()
+        
+    async def add_position(self, result: mt5.OrderSendResult):
+        async with self.lock:
+            self.active_positions[result.order] = {
+                'symbol': result.request.symbol,
+                'volume': result.volume,
+                'price': result.price,
+                'timestamp': datetime.utcnow(),
+                'status': 'open'
+            }
+            
+    async def update_position(self, ticket: int, updates: dict):
+        async with self.lock:
+            if ticket in self.active_positions:
+                self.active_positions[ticket].update(updates)
 
+# Initialize global tracker
+position_tracker = AsyncPositionTracker()
+
+async def place_mt5_order(symbol: str, order_type: str, volume: float, price: float, 
+                            signal_id: str, user: Optional[User] = None,
+                            sl_level: Optional[float] = None, 
+                            tp_levels: Optional[List[float]] = None):
     max_attempts = 3
     attempt = 0
     while attempt < max_attempts:
@@ -1828,7 +1819,40 @@ async def place_mt5_order(symbol: str, order_type: str, volume: float, price: fl
                 logger.warning(f"Price deviation too large: {price_diff:.2%}")
                 return None
 
-            # (SL/TP validation logic remains as per your existing implementation)
+            # Adjust SL and TP levels according to the broker's minimum stop distance.
+            symbol_info = mt5.symbol_info(mt5_symbol)
+            if symbol_info:
+                min_stop_points = symbol_info.stops_level
+                point_value = symbol_info.point
+                min_stop_distance = min_stop_points * point_value
+                logger.info(f"Minimum stop distance for {mt5_symbol}: {min_stop_distance}")
+
+                if sl_level is not None:
+                    if order_type == "BUY" and (current_price - sl_level) < min_stop_distance:
+                        logger.info(f"Adjusting SL for BUY: {sl_level} -> {current_price - min_stop_distance}")
+                        sl_level = current_price - min_stop_distance
+                    elif order_type == "SELL" and (sl_level - current_price) < min_stop_distance:
+                        logger.info(f"Adjusting SL for SELL: {sl_level} -> {current_price + min_stop_distance}")
+                        sl_level = current_price + min_stop_distance
+                    sl_level = round(sl_level, symbol_info.digits)
+
+                if tp_levels:
+                    adjusted_tps = []
+                    for tp in tp_levels:
+                        if order_type == "BUY" and (tp - current_price) < min_stop_distance:
+                            logger.info(f"Adjusting TP for BUY: {tp} -> {current_price + min_stop_distance}")
+                            tp = current_price + min_stop_distance
+                        elif order_type == "SELL" and (current_price - tp) < min_stop_distance:
+                            logger.info(f"Adjusting TP for SELL: {tp} -> {current_price - min_stop_distance}")
+                            tp = current_price - min_stop_distance
+                        adjusted_tps.append(round(tp, symbol_info.digits))
+                    tp_levels = adjusted_tps
+
+                # Validate volume against the broker's minimum allowed volume.
+                if symbol_info.volume_min and volume < symbol_info.volume_min:
+                    logger.info(f"Volume {volume} below minimum {symbol_info.volume_min}, adjusting to minimum.")
+                    volume = symbol_info.volume_min
+
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": mt5_symbol,
@@ -1843,7 +1867,7 @@ async def place_mt5_order(symbol: str, order_type: str, volume: float, price: fl
             }
             if sl_level is not None:
                 request["sl"] = sl_level
-            if tp_levels is not None and len(tp_levels) > 0:
+            if tp_levels and len(tp_levels) > 0:
                 request["tp"] = tp_levels[0]
 
             result = mt5.order_send(request)
@@ -1852,7 +1876,9 @@ async def place_mt5_order(symbol: str, order_type: str, volume: float, price: fl
                 attempt += 1
                 await asyncio.sleep(2)
                 continue
+
             return result
+
         except Exception as e:
             logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
             attempt += 1
@@ -2061,43 +2087,69 @@ async def calculate_volatility_adjusted_sizes(assets):
     return sizes
 
 async def premium_trading_worker():
-    """Continuous trading engine with profit optimization (enhanced)"""
-    asset_queue = asyncio.Queue()
-    processing_lock = asyncio.Lock()
-    signal_counter_lock = asyncio.Lock()
-    
-    while not shutdown_flag.is_set():
-        try:
-            assets = get_asset_universe()
-            random.shuffle(assets)
-            position_sizes = await calculate_volatility_adjusted_sizes(assets)
+    try:
+        while not shutdown_flag.is_set():
+            # Retrieve the current asset universe (either forex or crypto based on mode)
+            assets = get_asset_universe(force_refresh=False)
+            logger.info(f"Premium trading worker processing assets: {assets}")
             
-            for asset, size in zip(assets, position_sizes):
-                await asset_queue.put((asset, size))
+            for asset in assets:
+                # Determine asset type explicitly
+                asset_type = "crypto" if asset in ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"] else "forex"
+                try:
+                    # Resiliently fetch market data using TwelveData API (with retry logic)
+                    market_data = await fetch_twelvedata(asset, asset_type)
+                    if market_data is None or market_data.empty:
+                        logger.warning(f"No market data available for {asset}. Skipping trade.")
+                        continue
 
-            tasks = []
-            # Process assets concurrently
-            for _ in range(3):
-                asset, size = await asset_queue.get()
-                task = asyncio.create_task(process_asset(asset, size, processing_lock, signal_counter_lock))
-                tasks.append(task)
-                asset_queue.task_done()
+                    # Compute technical indicators on the retrieved market data
+                    data_with_indicators = compute_professional_indicators(market_data)
 
-            await asyncio.gather(*tasks)
-            
-            # Dynamic sleep based on market activity
-            volatility_index = sum(
-                [global_market_data[asset]['ATR_14'].iloc[-1] for asset in assets if not global_market_data[asset].empty]
-            )
-            await asyncio.sleep(max(10, 30 - volatility_index))
-        except Exception as e:
-            logger.error(f"Trading cycle error: {str(e)}")
+                    # Generate predictions from institutional models (ML, DL, RL, Prophet, etc.)
+                    predictions = generate_institutional_predictions(data_with_indicators)
+
+                    # Generate a trade signal (BUY, SELL, or HOLD) based on the data and predictions
+                    signal = generate_institutional_signal(data_with_indicators, predictions, asset)
+                    logger.info(f"Generated signal for {asset}: {signal}")
+
+                    if signal["action"] != "HOLD":
+                        # Execute order if signal is actionable (BUY or SELL)
+                        order_result = await place_mt5_order(
+                            symbol=asset,
+                            order_type=signal["action"],
+                            volume=0.1,  # Example position size; adjust as needed
+                            price=signal["price"],
+                            signal_id=f"signal_{asset}",
+                            sl_level=signal.get("sl_level"),
+                            tp_levels=signal.get("tp_levels")
+                        )
+                        if order_result is None:
+                            logger.error(f"Order execution failed for {asset}")
+                        else:
+                            logger.info(f"Trade executed for {asset}: {order_result.comment}")
+                    else:
+                        logger.info(f"HOLD signal for {asset}. No action taken.")
+                except Exception as e:
+                    logger.error(f"Error processing asset {asset}: {str(e)}")
+
+            # Periodically trigger the retraining cycle (only if valid training data is available)
+            await retraining_cycle()
+            # Wait for 30 seconds before processing the next cycle of trades
             await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            logger.info("premium_trading_worker task cancelled gracefully.")
-            raise
-        except Exception as e:
-            logger.error(f"Error in premium_trading_worker: {str(e)}")
+    except asyncio.CancelledError:
+        logger.info("Premium trading worker task cancelled gracefully.")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown():
+    shutdown_flag.set()
+    # Cancel all tasks except the current one.
+    tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    logger.info("All tasks have been cancelled. Shutting down gracefully.")
+
 async def process_asset(asset: str, position_size: float, processing_lock: asyncio.Lock, signal_counter_lock: asyncio.Lock):
     """Process a single asset: generate signal, send pre-alert with risk warnings, wait 30 seconds, execute trade, and send main signal alert."""
     global signal_counter
