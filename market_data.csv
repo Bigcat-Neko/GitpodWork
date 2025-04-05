@@ -1,1 +1,3 @@
-"{""code"":401,""message"":""**apikey** parameter is incorrect or not specified. You can get your free API key instantly following this link: https://twelvedata.com/pricing. If you believe that everything is correct, you can contact us at https://twelvedata.com/contact/customer"",""status"":""error""}",timestamp,open,high,low,close,volume,symbol
+version https://git-lfs.github.com/spec/v1
+oid sha256:04e079977cbb2ca23e21fc9949dd34dcc695606dc37949ece2aa7400de56fdf6
+size 348

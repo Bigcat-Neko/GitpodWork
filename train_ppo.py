@@ -5,7 +5,7 @@ from trading_env import TradingEnv
 
 def train_ppo():
     print("\n===== Training PPO Model =====")
-    # Set window_size to 30 to match the new observation dimension
+    # Use window_size=30 so that the observation vector has 30 features.
     env = TradingEnv(window_size=30)
     model = PPO("MlpPolicy", env, verbose=1)
     model.learn(total_timesteps=50000)

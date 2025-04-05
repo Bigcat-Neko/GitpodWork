@@ -1,82 +1,71 @@
 import os
+import time
 import requests
 import pandas as pd
-import time
 from dotenv import load_dotenv
+import talib
 
-# Load your environment variables from the .env file
+# Load API key from .env
 load_dotenv()
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
+API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# Function to fetch historical data from Twelve Data for a given symbol.
-def fetch_data(symbol, interval='1day', outputsize=200):
-    url = "https://api.twelvedata.com/time_series"
+# List of Forex-major pairs and crypto pairs
+assets = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD", 
+    "EUR/GBP", "EUR/JPY", "BTC/USD", "ETH/USD", "BNB/USD", "XRP/USD", "ADA/USD", 
+    "SOL/USD", "DOGE/USD", "DOT/USD", "MATIC/USD", "LTC/USD"
+]
+
+# Define function to fetch and process data
+def fetch_data(asset):
+    print(f"🔄 Fetching live data for {asset}...")
+    
+    url = f"https://api.twelvedata.com/time_series"
     params = {
-        'symbol': symbol,
-        'interval': interval,
-        'outputsize': outputsize,
-        'apikey': API_KEY,
-        'format': 'JSON'
+        'symbol': asset,
+        'interval': '1h',  # 1-hour data for now; you can adjust based on your needs
+        'apikey': API_KEY
     }
+    
     response = requests.get(url, params=params)
     data = response.json()
-    if "values" in data:
-        df = pd.DataFrame(data["values"])
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        # Convert price columns to float
-        df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
-        df['asset'] = symbol
-        df.sort_values("datetime", inplace=True)
-        return df
-    else:
-        print(f"Error fetching data for {symbol}: {data.get('message', 'Unknown error')}")
-        return pd.DataFrame()
+    
+    if 'values' not in data:
+        print(f"⚠️ Error fetching {asset}: {data.get('message', 'Unknown error')}")
+        return None
+    
+    # Convert to pandas DataFrame
+    df = pd.DataFrame(data['values'])
+    
+    # Ensure the proper column types
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['open'] = pd.to_numeric(df['open'])
+    df['high'] = pd.to_numeric(df['high'])
+    df['low'] = pd.to_numeric(df['low'])
+    df['close'] = pd.to_numeric(df['close'])
+    df['volume'] = pd.to_numeric(df['volume'])
+    
+    # Calculate technical indicators
+    df['SMA_20'] = talib.SMA(df['close'], timeperiod=20)
+    df['SMA_50'] = talib.SMA(df['close'], timeperiod=50)
+    df['RSI_14'] = talib.RSI(df['close'], timeperiod=14)
+    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+    
+    # Drop rows with NaN values (due to technical indicators requiring past data)
+    df.dropna(inplace=True)
+    
+    # Save the data
+    file_path = f"data/{asset.replace('/', '-')}.csv"
+    df.to_csv(file_path, index=False)
+    
+    print(f"✅ Data saved for {asset}")
+    return df
 
-# Define lists of symbols for Forex and Crypto.
-forex_main = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD",
-    "USD/CHF", "USD/CAD", "NZD/USD", "EUR/GBP",
-    "EUR/JPY", "GBP/JPY"
-]
+# Main script to fetch data for each asset
+def main():
+    for asset in assets:
+        fetch_data(asset)
+        time.sleep(15)  # Wait 15 seconds before fetching the next asset to avoid hitting API rate limit
 
-crypto_assets = [
-    "BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD",
-    "BCH/USD", "ADA/USD", "DOT/USD", "LINK/USD"
-]
-
-dfs = []
-
-# Total delay between calls (in seconds) to not exceed the rate limit.
-# Adjust this delay based on your API plan's rate limit.
-delay_seconds = 10
-
-# Fetch Forex data
-for symbol in forex_main:
-    print(f"Fetching Forex data for: {symbol}")
-    df = fetch_data(symbol, interval="1day", outputsize=200)
-    if not df.empty:
-        dfs.append(df)
-    time.sleep(delay_seconds)  # Delay between calls
-
-# Fetch Crypto data
-for symbol in crypto_assets:
-    print(f"Fetching Crypto data for: {symbol}")
-    df = fetch_data(symbol, interval="1day", outputsize=200)
-    if not df.empty:
-        dfs.append(df)
-    time.sleep(delay_seconds)  # Delay between calls
-
-# Combine all data frames into one DataFrame
-combined_df = pd.concat(dfs, ignore_index=True)
-
-# Create a new feature - a simple moving average (SMA) of the closing price over 5 periods
-combined_df["SMA_5"] = combined_df.groupby("asset")["close"].transform(lambda x: x.rolling(window=5).mean())
-
-# Drop any rows with missing values (which may appear due to the rolling window calculation)
-combined_df.dropna(inplace=True)
-
-# Save the combined processed data to a CSV file
-combined_df.to_csv("training_data.csv", index=False)
-
-# Print the first few rows to verify the results
-print(combined_df.head())
+if __name__ == "__main__":
+    main()

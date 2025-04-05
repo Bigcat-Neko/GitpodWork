@@ -8,9 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def compute_ATR(prices, window=14):
-    # A simple ATR computation assuming prices is a 1-D array of close prices.
-    # In practice, ATR is computed from high, low, close.
-    # Here we use the absolute difference of consecutive close prices as a proxy.
+    # A simple ATR computation using close price differences as a proxy.
     diffs = np.abs(np.diff(prices))
     if len(diffs) < window:
         return np.mean(diffs) if diffs.size > 0 else 0.0
@@ -19,7 +17,11 @@ def compute_ATR(prices, window=14):
 class TradingEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
     
-    def __init__(self, prices=None, window_size=10):
+    def __init__(self, prices=None, window_size=30):
+        """
+        Initializes the trading environment.
+        Observation space will be a vector of the last `window_size` normalized prices.
+        """
         super().__init__()
         self.window_size = window_size
         
@@ -44,33 +46,19 @@ class TradingEnv(gym.Env):
         self.position = 0  # 0: Flat, 1: Long, -1: Short
         self.done = False
         
-        # Here, we create an observation space that includes:
-        # - The window of normalized prices.
-        # - A simple moving average over the window.
-        # - The rolling ATR computed over the window.
+        # The observation is now simply the most recent window of normalized prices.
         self.observation_space = spaces.Box(
             low=0.0, 
             high=1.0, 
-            shape=(3 * self.window_size,), 
+            shape=(self.window_size,), 
             dtype=np.float32
         )
-        self.action_space = spaces.Discrete(3)  # 0=Hold, 1=Buy, 2=Sell
-
-    def _compute_indicators(self, window_prices):
-        # Compute a simple moving average
-        sma = np.mean(window_prices)
-        # Compute a proxy for ATR as the mean absolute difference
-        atr = np.mean(np.abs(np.diff(window_prices)))
-        return sma, atr
+        self.action_space = spaces.Discrete(3)  # 0 = Hold, 1 = Buy, 2 = Sell
 
     def _get_obs(self):
-        # Get the current window of prices.
+        # Return the current window of prices.
         window = self.prices[self.current_step - self.window_size:self.current_step]
-        # Compute indicators for this window.
-        sma, atr = self._compute_indicators(window)
-        # For simplicity, we return a concatenated vector: [prices, SMA repeated, ATR repeated]
-        obs = np.concatenate([window, np.full(self.window_size, sma), np.full(self.window_size, atr)])
-        return obs
+        return window
 
     def reset(self, seed=None, options=None):
         self.current_step = self.window_size
@@ -85,7 +73,7 @@ class TradingEnv(gym.Env):
             
         prev_price = self.prices[self.current_step - 1]
         current_price = self.prices[self.current_step]
-        # Reward is calculated as profit from the previous position.
+        # Reward is calculated based on profit from the previous position.
         reward = (current_price - prev_price) * self.position
         
         # Update position based on the action.
@@ -93,18 +81,15 @@ class TradingEnv(gym.Env):
             self.position = 1
         elif action == 2:
             self.position = -1
-        else:
-            # If hold, keep the current position.
-            pass
+        # Otherwise, hold the current position.
             
         self.current_step += 1
         self.done = self.current_step >= len(self.prices)
         
         obs = self._get_obs()
-        # Gymnasium step returns (observation, reward, terminated, truncated, info)
+        # Gymnasium's step returns (observation, reward, terminated, truncated, info)
         return obs, reward, self.done, False, {}
 
     def render(self, mode="human"):
         if mode == "human":
             print(f"Step: {self.current_step}, Price: {self.prices[self.current_step]:.4f}, Position: {self.position}")
-
