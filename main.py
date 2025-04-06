@@ -75,6 +75,7 @@ if not encryption_key:
     print("Please set ENCRYPTION_KEY in your environment to:", encryption_key)
 cipher_suite = Fernet(encryption_key)
 
+# Replace the existing cache initialization with:
 cache = Cache("./.api_cache")
 
 app = FastAPI()
@@ -85,12 +86,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Initialize missing attributes for retraining fixes
+# Initialize market data store and other attributes
 app.market_data_store = cache  # assuming you're using the same cache instance
 app.data_lock = asyncio.Lock()
+app.shutdown_flag = asyncio.Event()
+app.models = {}  # This will store your RL models
 
 nest_asyncio.apply()
-cache = Cache("./.api_cache")
+
+# Helper functions for data access
+def get_historical_data():
+    data = app.market_data_store.get("historical_data")
+    return data if data is not None else pd.DataFrame()
+
+def get_recent_data():
+    data = app.market_data_store.get("recent_data")
+    return data if data is not None else pd.DataFrame()
+
+# Attach helper methods to app instance
+app.get_historical_data = get_historical_data
+app.get_recent_data = get_recent_data
+
+# During startup, after initializing the app
 
 async def reset_daily_counters():
     global twelvedata_calls_today, alphavantage_calls_today
@@ -107,15 +124,32 @@ async def startup_event():
     load_all_models()
     asyncio.create_task(start_telegram_listener())
     asyncio.create_task(refresh_market_data())
-    asyncio.create_task(premium_trading_worker()) 
+    asyncio.create_task(premium_trading_worker())
     asyncio.create_task(monitor_trades())
+    
+    # Initialize retrain system AFTER setting up market_data_store
     retrain_system = RetrainRLSystem(app)
+    app.retrain_rl_system = retrain_system  # Attach to app instance
     asyncio.create_task(retrain_system.continuous_retraining_scheduler())
     asyncio.create_task(retrain_system.monitor_performance())
-    asyncio.create_task(reset_daily_counters())
     
-    # Start the new trade execution integration task.
-    asyncio.create_task(process_signals_and_trade())
+    # Start other tasks
+    asyncio.create_task(reset_daily_counters())
+    async def process_signals_and_trade():
+        """
+        This function processes trading signals and executes trades.
+        Add your logic here to handle signals and trade execution.
+        """
+        while not app.shutdown_flag.is_set():
+            try:
+                # Example logic for processing signals
+                signal = await signal_queue.get()
+                await process_trade_signal(signal)
+            except Exception as e:
+                logger.error(f"Error in process_signals_and_trade: {str(e)}")
+            await asyncio.sleep(1)
+    
+        asyncio.create_task(process_signals_and_trade())
     
     logger.info("NekoAIBot Active with Enhanced API Management and Trade Execution Integration")
 
@@ -145,6 +179,11 @@ SMTP_PORT = os.getenv("SMTP_PORT")
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "noreply@yourdomain.com")
+
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG to capture detailed logs.
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,8 +234,9 @@ alphavantage_limiter = IntelligentRateLimiter(max_calls=4, period=65)
 MAX_CONCURRENT_TRADES = 5
 RISK_PER_TRADE = 0.02
 MIN_RISK_REWARD = 3.0     
+# Replace existing signal_counter_lock definition
 signal_counter = 1
-signal_counter_lock = threading.Lock()
+signal_counter_lock = asyncio.Lock()  # Changed from threading.Lock
 trading_mode_override = None
 models = {}
 model_lock = threading.Lock()
@@ -287,11 +327,19 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-def verify_password(plain_password: str, hashed_password: str):
-    return pwd_context.verify(plain_password, hashed_password)
-
 def get_password_hash(password: str):
-    return pwd_context.hash(password)
+    try:
+        return pwd_context.hash(password)
+    except Exception as e:
+        logger.error(f"Password hash generation error: {str(e)}")
+        raise
+
+def verify_password(plain_password: str, hashed_password: str):
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        logger.error(f"Password verification error: {str(e)}")
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -465,7 +513,7 @@ async def switch_mode(mode: str, request: Request, current_user: User = Depends(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
             await session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHANNEL_ID, "text": msg, "parse_mode": "Markdown"}
+                json={"chat_id": TELEGRAM_CHANNEL_ID, "text": msg, "parse_mode": "HTML"}
             )
     except Exception as e:
         logger.error(f"Telegram notification error: {str(e)}")
@@ -618,7 +666,10 @@ def initialize_mt5_admin(max_attempts=3):
     return False
 
 async def monitor_trades():
-    """Monitor open trades, adjust SL/TP to secure profits, and close trades once profit thresholds are reached."""
+    """
+    Monitors open trades, adjusts SL/TP to secure profits, and closes trades once profit thresholds are reached.
+    Sends Telegram updates when trades are closed or updated.
+    """
     while not shutdown_flag.is_set():
         try:
             if MT5_AVAILABLE:
@@ -644,27 +695,24 @@ async def monitor_trades():
                         if not tick:
                             continue
                         current_price = tick.ask if pos.type == mt5.ORDER_TYPE_BUY else tick.bid
-
                         open_price = pos.price_open
                         profit_pct = (current_price - open_price) / open_price if pos.type == mt5.ORDER_TYPE_BUY else (open_price - current_price) / open_price
 
-                        # If profit is above the full threshold, close the trade.
+                        # Close trade if profit threshold reached
                         if profit_pct >= PROFIT_THRESHOLD_PERCENT:
                             result = close_trade(pos)
                             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                                 logger.info(f"Trade {pos.ticket} for {pos.symbol} closed at profit {profit_pct*100:.2f}%.")
                                 close_signal = {
-                                    "asset": pos.symbol,
-                                    "action": "CLOSE",
-                                    "ticket": pos.ticket,
-                                    "profit_percent": round(profit_pct * 100, 2),
-                                    "timestamp": datetime.utcnow().isoformat()
+                                    "chat_id": TELEGRAM_CHANNEL_ID,
+                                    "text": f"Trade {pos.ticket} for {pos.symbol} closed at profit {profit_pct*100:.2f}%.",
+                                    "parse_mode": "HTML"
                                 }
-                                await send_telegram_alert(close_signal)
+                                await _send_telegram_with_retry(close_signal)
                             else:
                                 logger.error(f"Failed to close trade {pos.ticket} for {pos.symbol}: {result.comment if result else 'No result'}")
                         else:
-                            # Adjust SL/TP using trailing stop logic.
+                            # Adjust stop loss using trailing stop logic
                             buffer_threshold = current_price * 0.005  # 0.5% buffer
                             new_sl = pos.sl
                             symbol_info = mt5.symbol_info(pos.symbol)
@@ -680,16 +728,14 @@ async def monitor_trades():
 
                             if new_sl != pos.sl and new_sl > 0:
                                 result = update_mt5_trade(pos, new_sl, pos.tp)
-                                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                                     logger.info(f"Updated trade {pos.ticket} for {pos.symbol} with new SL: {new_sl}")
                                     update_signal = {
-                                        "asset": pos.symbol,
-                                        "action": "UPDATE",
-                                        "ticket": pos.ticket,
-                                        "new_sl": new_sl,
-                                        "timestamp": datetime.utcnow().isoformat()
+                                        "chat_id": TELEGRAM_CHANNEL_ID,
+                                        "text": f"Trade {pos.ticket} for {pos.symbol} updated with new SL: {new_sl}",
+                                        "parse_mode": "HTML"
                                     }
-                                    await send_telegram_alert(update_signal)
+                                    await _send_telegram_with_retry(update_signal)
                                 else:
                                     logger.error(f"Failed to update trade {pos.ticket}: {result.comment}")
                     except Exception as e:
@@ -732,14 +778,55 @@ def shutdown_mt5_admin():
     if MT5_AVAILABLE:
         mt5.shutdown()
 
-async def place_mt5_order(symbol: str, order_type: str, volume: float, price: float, 
-                         signal_id: str, user: Optional[User] = None,
-                         sl_level: Optional[float] = None, 
-                         tp_levels: Optional[List[float]] = None):
+def process_data(data: dict) -> pd.DataFrame:
+    """Data processing with explicit datetime formats"""
+    try:
+        if "values" in data:  # TwelveData format
+            df = pd.DataFrame(data["values"])
+            df["timestamp"] = pd.to_datetime(df["datetime"], format='%Y-%m-%d %H:%M:%S')
+            df = df.rename(columns={
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume"
+            })
+        else:  # AlphaVantage format
+            ts_key = "Time Series (Digital Currency Daily)"
+            df = pd.DataFrame.from_dict(data[ts_key], orient="index")
+            df.index = pd.to_datetime(df.index, format='%Y-%m-%d')
+            df = df.rename(columns={
+                "1a. open (USD)": "open",
+                "2a. high (USD)": "high",
+                "3a. low (USD)": "low", 
+                "4a. close (USD)": "close"
+            })
+
+        numeric_cols = ["open", "high", "low", "close"]
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        return df.dropna().sort_index()
+        
+    except Exception as e:
+        logger.error(f"Data processing failed: {str(e)}")
+        return pd.DataFrame()
+    
+async def place_mt5_order(
+    symbol: str,
+    order_type: str,
+    volume: float,
+    price: float,
+    signal_id: str,
+    user: Optional[User] = None,
+    sl_level: Optional[float] = None,
+    tp_levels: Optional[List[float]] = None
+):
+    """Enhanced MT5 order placement with comprehensive validation"""
     max_attempts = 3
     attempt = 0
+    
     while attempt < max_attempts:
         try:
+            # Initialize MT5 connection
             if user:
                 with SessionLocal() as db:
                     if not initialize_user_mt5(user, db):
@@ -748,82 +835,100 @@ async def place_mt5_order(symbol: str, order_type: str, volume: float, price: fl
             elif not initialize_mt5_admin():
                 logger.error("Global MT5 init failed")
                 return None
+
+            # Symbol validation
             mt5_symbol = symbol.replace("/", "")
-            if MT5_AVAILABLE and not mt5.symbol_select(mt5_symbol, True):
+            if not mt5.symbol_select(mt5_symbol, True):
                 logger.error(f"Symbol {mt5_symbol} not available")
                 return None
+
+            symbol_info = mt5.symbol_info(mt5_symbol)
+            if not symbol_info:
+                logger.error("No symbol info available")
+                return None
+
+            # Validate required attributes
+            required_attrs = ['stops_level', 'point', 'digits', 'volume_min']
+            missing = [attr for attr in required_attrs if not hasattr(symbol_info, attr)]
+            if missing:
+                logger.error(f"Missing critical attributes for {symbol}: {missing}")
+                return None
+
+            # Get current market price
             tick = mt5.symbol_info_tick(mt5_symbol)
             if not tick:
                 logger.error("No tick data available")
                 raise Exception("No tick data")
-            current_price = tick.ask if order_type == "BUY" else tick.bid
-            price_diff = abs(current_price - price)/price
+
+            current_price = tick.ask if order_type.upper() == "BUY" else tick.bid
+            price_diff = abs(current_price - price) / price
             if price_diff > 0.01:
                 logger.warning(f"Price deviation too large: {price_diff:.2%}")
                 return None
 
-            # FIX: Add proper stop level validation
-            symbol_info = mt5.symbol_info(mt5_symbol)
-            if symbol_info:
-                min_stop_points = symbol_info.stops_level
-                point_value = symbol_info.point
-                min_stop_distance = min_stop_points * point_value
-                
-                # Adjust SL and TP levels to meet minimum distance requirements
-                if sl_level is not None:
-                    if order_type == "BUY":
-                        if (current_price - sl_level) < min_stop_distance:
-                            sl_level = current_price - min_stop_distance
+            # Calculate minimum stop distance
+            min_stop_points = symbol_info.stops_level
+            point_value = symbol_info.point
+            min_stop_distance = min_stop_points * point_value
+
+            # Adjust SL/TP levels
+            if sl_level is not None:
+                if order_type.upper() == "BUY":
+                    sl_level = max(sl_level, current_price - min_stop_distance)
+                else:
+                    sl_level = min(sl_level, current_price + min_stop_distance)
+                sl_level = round(sl_level, symbol_info.digits)
+
+            if tp_levels:
+                adjusted_tps = []
+                for tp in tp_levels:
+                    if order_type.upper() == "BUY":
+                        tp = max(tp, current_price + min_stop_distance)
                     else:
-                        if (sl_level - current_price) < min_stop_distance:
-                            sl_level = current_price + min_stop_distance
-                    sl_level = round(sl_level, symbol_info.digits)
-                
-                if tp_levels:
-                    adjusted_tps = []
-                    for tp in tp_levels:
-                        if order_type == "BUY":
-                            if (tp - current_price) < min_stop_distance:
-                                tp = current_price + min_stop_distance
-                        else:
-                            if (current_price - tp) < min_stop_distance:
-                                tp = current_price - min_stop_distance
-                        adjusted_tps.append(round(tp, symbol_info.digits))
-                    tp_levels = adjusted_tps
+                        tp = min(tp, current_price - min_stop_distance)
+                    adjusted_tps.append(round(tp, symbol_info.digits))
+                tp_levels = adjusted_tps
 
-            # FIX: Validate volume against minimum allowed
-            if symbol_info and symbol_info.volume_min:
-                if volume < symbol_info.volume_min:
-                    logger.info(f"Volume {volume} below minimum {symbol_info.volume_min}, adjusting volume to minimum.")
-                    volume = symbol_info.volume_min
+            # Validate volume
+            if volume <= 0 or volume < symbol_info.volume_min:
+                volume = max(calculate_lot_size(symbol, current_price, sl_level), symbol_info.volume_min)
+                logger.info(f"Adjusted volume to {volume}")
 
+            # Prepare order request
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": mt5_symbol,
                 "volume": volume,
-                "type": mt5.ORDER_TYPE_BUY if order_type == "BUY" else mt5.ORDER_TYPE_SELL,
+                "type": mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL,
                 "price": current_price,
                 "deviation": 10,
                 "magic": 234000,
-                "comment": f"NEKO_{signal_id}",
+                "comment": f"NekoAITrader_{signal_id}",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_FOK,
             }
+            
             if sl_level is not None:
                 request["sl"] = sl_level
-            if tp_levels is not None and len(tp_levels) > 0:
+            if tp_levels:
                 request["tp"] = tp_levels[0]
+
+            # Execute order
             result = mt5.order_send(request)
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 logger.error(f"Order failed: {result.comment}")
                 attempt += 1
                 await asyncio.sleep(2)
                 continue
+                
             return result
+
         except Exception as e:
             logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
             attempt += 1
             await asyncio.sleep(2)
+            
+    logger.error(f"Failed all {max_attempts} order attempts for {symbol}")
     return None
 
 def update_mt5_trade(position, new_sl, new_tp):
@@ -865,18 +970,16 @@ class EnhancedCircuitBreaker:
 app.state.circuit_breaker = EnhancedCircuitBreaker()
 
 async def fetch_yahoo_data(symbol: str, asset_type: str) -> pd.DataFrame:
-    """
-    Fetch market data from Yahoo Finance.
-    Updated to explicitly set auto_adjust=True so that the new default behavior is enforced.
-    """
     try:
-        if "/" in symbol:
+        if asset_type == "forex":
+            yf_symbol = symbol.replace("/", "") + "=X"
+        elif "/" in symbol:
             yf_symbol = symbol.replace("/", "-")
         elif "-" not in symbol and len(symbol) > 3:
             yf_symbol = symbol[:-3] + "-" + symbol[-3:]
         else:
             yf_symbol = symbol
-        # Explicitly set auto_adjust=True
+        # Explicitly set auto_adjust=True to handle dividends/splits properly
         data = yf.download(yf_symbol, period="1d", interval="1m", auto_adjust=True)
         if data.empty:
             return pd.DataFrame()
@@ -895,27 +998,42 @@ async def fetch_yahoo_data(symbol: str, asset_type: str) -> pd.DataFrame:
         logger.error(f"Yahoo Finance fetch failed for {symbol}: {str(e)}")
         return pd.DataFrame()
 
-# ====================== DATA FETCHING ======================
+# ====================== UPDATED DATA FETCHING ======================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def fetch_market_data(symbol: str, asset_type: str):
-    # Always attempt to fetch live data from TwelveData if within the daily call limit.
-    if twelvedata_calls_today < TWELVEDATA_DAILY_LIMIT - 5:
-        await twelvedata_limiter.acquire()
-        data = await fetch_twelvedata(symbol, asset_type)
-        if data is not None and not data.empty:
+    """Fetch data with fallback and quality checks"""
+    try:
+        data = pd.DataFrame()
+        
+        # Try TwelveData first
+        if twelvedata_calls_today < TWELVEDATA_DAILY_LIMIT - 10:
+            await twelvedata_limiter.acquire()
+            data = await fetch_twelvedata(symbol, asset_type)
             track_api_usage("TwelveData")
-            # Add a short delay after a successful API call to avoid rapid consecutive requests.
-            await asyncio.sleep(5)
-            return compute_professional_indicators(data)
-    # Fallback: fetch live data from Yahoo Finance.
-    ydata = await fetch_yahoo_data(symbol, asset_type)
-    if not ydata.empty:
-        # Add a delay after the API call.
-        await asyncio.sleep(10)
-        return compute_professional_indicators(ydata)
-    # If no live data could be retrieved, return an empty DataFrame.
-    return pd.DataFrame()
+            
+        # Fallback to Yahoo if needed
+        if data.empty or data['close'].isnull().all():
+            logger.warning(f"Falling back to Yahoo for {symbol}")
+            data = await fetch_yahoo_data(symbol, asset_type)
+            if not data.empty:
+                data = compute_professional_indicators(data)
+                track_api_usage("Yahoo")
 
+        # Validate data quality
+        if len(data) < 100 or data['close'].isnull().any():
+            logger.error(f"Insufficient quality data for {symbol}")
+            return pd.DataFrame()
+
+        # Cache clean data
+        async with app.data_lock:
+            global_market_data[symbol] = data
+            
+        return data
+
+    except Exception as e:
+        logger.error(f"Data fetch critical error: {str(e)}")
+        return pd.DataFrame()
+    
 async def fetch_alphavantage(symbol: str, asset_type: str):
     function = "DIGITAL_CURRENCY_DAILY" if asset_type == "crypto" else "FX_DAILY"
     params = {
@@ -1110,24 +1228,25 @@ def prepare_features(df: pd.DataFrame, model_type: str):
     fixed_features = ['close', 'RSI_14', 'STOCH_%K', 'ADX_14', '+DI_14', '-DI_14',
                       'BB_MIDDLE', 'ATR_14', 'SMA_50', 'EMA_9']
     try:
-        # Ensure required features exist.
         for col in fixed_features:
             if col not in df.columns:
                 df[col] = df['close']
-                
         features = df[fixed_features].dropna()
         if features.empty:
             return None
 
         if model_type == "rl":
             features = features.tail(1).copy()
-            features['ATR_Ratio'] = features['ATR_14'] / features['close']
-            feature_array = features.values  # initial shape (1, n)
+            # Extract scalars using .item() to avoid FutureWarnings
+            atr_val = features['ATR_14'].iloc[0].item() if hasattr(features['ATR_14'].iloc[0], 'item') else float(features['ATR_14'].iloc[0])
+            close_val = features['close'].iloc[0].item() if hasattr(features['close'].iloc[0], 'item') else float(features['close'].iloc[0])
+            # Use .loc to assign the new column without shape conflicts
+            features.loc[:, 'ATR_Ratio'] = atr_val / close_val
+            feature_array = features.values  # shape (1, n)
             current_cols = feature_array.shape[1]
             if current_cols < 30:
-                # Pad with zeros on the right to achieve 30 features.
                 feature_array = np.pad(feature_array, ((0, 0), (0, 30 - current_cols)), 'constant')
-            return feature_array  # shape now (1,30)
+            return feature_array
         elif model_type == "ml":
             return features.tail(1).values.reshape(1, -1)
         elif model_type == "dl":
@@ -1139,7 +1258,7 @@ def prepare_features(df: pd.DataFrame, model_type: str):
     except Exception as e:
         logger.error(f"Feature error: {str(e)}")
         return None
-    
+
 # ====================== CORE INDICATOR CALCULATION ======================
 # ----- Fix 1: Attach a get_historical_data method to the app -----
 def get_historical_data():
@@ -1161,92 +1280,225 @@ app.get_historical_data = get_historical_data
 app.get_recent_data = get_recent_data
 
 
-# ----- Updated compute_professional_indicators to avoid column overlap -----
-def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
+def is_market_open(symbol: str) -> bool:
+    """
+    Check if the market for the given symbol is open.
+    (This example uses forex hours 08:00–17:00 UTC; adjust as needed for your assets.)
+    """
+    now = datetime.utcnow().time()
+    return dt_time(8, 0) <= now <= dt_time(17, 0)
+
+def get_validation_data():
+    """
+    Retrieve performance validation data for the trading system.
+    This function calculates metrics based on historical trades such as total trades,
+    win rate, average profit/loss, maximum profit/loss, and average trade duration.
+    
+    It expects the global variable 'historical_trades' to be a list of dictionaries
+    with keys:
+        - 'entry_price': float
+        - 'exit_price': float
+        - 'profit': float
+        - 'entry_time': string or datetime (ISO formatted)
+        - 'exit_time': string or datetime (ISO formatted)
+    
+    Returns:
+        pd.DataFrame: A DataFrame containing performance metrics.
+    """
+    # Check if there are any historical trades available.
+    if not historical_trades:
+        logger.warning("No historical trades available for validation.")
+        return pd.DataFrame()
+
     try:
-        df['SMA_50'] = ta.sma(df['close'], length=50)
-        df['EMA_9'] = ta.ema(df['close'], length=9)
-        df['RSI_14'] = ta.rsi(df['close'], length=14).fillna(50)
+        # Convert the list of trade dictionaries into a DataFrame.
+        df = pd.DataFrame(historical_trades)
         
-        # Bollinger Bands with suffix to avoid overlapping column names.
-        bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None:
-            df = df.join(bb, how='left', rsuffix='_bb')
+        total_trades = len(df)
+        wins = df[df['profit'] > 0]
+        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
+        avg_profit = df['profit'].mean() if total_trades > 0 else 0.0
+        max_profit = df['profit'].max() if total_trades > 0 else 0.0
+        max_loss = df['profit'].min() if total_trades > 0 else 0.0
         
-        atr = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['ATR_14'] = atr if (atr is not None and not atr.isnull().all()) else df['close'] * 0.01
-        
-        # Compute ADX and rename its columns for consistency.
-        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx is not None:
-            # Rename DMP_14 and DMN_14 to expected +DI_14 and -DI_14.
-            adx.rename(columns={'DMP_14': '+DI_14', 'DMN_14': '-DI_14'}, inplace=True)
-            # Remove any existing overlapping columns
-            for col in ['ADX_14', '+DI_14', '-DI_14']:
-                if col in df.columns:
-                    df.drop(columns=[col], inplace=True)
-            df = df.join(adx, how='left')
+        # If timestamps are provided, compute trade durations in minutes.
+        if 'entry_time' in df.columns and 'exit_time' in df.columns:
+            df['entry_time'] = pd.to_datetime(df['entry_time'], errors='coerce')
+            df['exit_time'] = pd.to_datetime(df['exit_time'], errors='coerce')
+            df['duration_minutes'] = (df['exit_time'] - df['entry_time']).dt.total_seconds() / 60.0
+            avg_duration = df['duration_minutes'].mean()
         else:
-            df[['ADX_14', '+DI_14', '-DI_14']] = 0.0
-        
-        df["ICHIMOKU_SENKOU_A"] = (df["high"].rolling(9).max() + df["low"].rolling(9).min()) / 2
-        df["ICHIMOKU_SENKOU_B"] = (df["high"].rolling(26).max() + df["low"].rolling(26).min()) / 2
-        
-        if "volume" in df.columns and not df["volume"].empty and (df["volume"] != 0).all():
-            df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-        else:
-            df["VWAP"] = df["close"]
-            
-        return df.ffill().bfill().dropna(how='all', axis=1)
+            avg_duration = None
+
+        # Collect all metrics into a dictionary.
+        metrics = {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'avg_profit': avg_profit,
+            'max_profit': max_profit,
+            'max_loss': max_loss,
+            'avg_duration_minutes': avg_duration
+        }
+        return pd.DataFrame([metrics])
     except Exception as e:
-        logger.error(f"Indicator error: {str(e)}")
-        return df
+        logger.error(f"Validation data retrieval failed: {str(e)}")
+        return pd.DataFrame()
 
-def compute_trade_levels(price: float, atr: float, side: str) -> dict:
-    """
-    Calculate stop loss and take profit levels.
-    This version validates the ATR and computes three take profit levels.
-    """
-    if atr <= 0 or np.isnan(atr):
-        atr = price * 0.01  # Fallback to 1% if invalid
-    if side.upper() == "BUY":
-        sl = price - atr
-        tp_levels = [max(price + atr, price * 1.005),
-                     price + 2 * atr,
-                     price + 3 * atr]
-    else:  # SELL
-        sl = price + atr
-        tp_levels = [min(price - atr, price * 0.995),
-                     price - 2 * atr,
-                     price - 3 * atr]
-    return {"sl_level": sl, "tp_levels": tp_levels}
+# Attach the function to your FastAPI app so it can be accessed elsewhere.
+app.get_validation_data = get_validation_data
 
+# ----- Updated compute_professional_indicators to avoid column overlap -----
+import numpy as np
+import pandas_ta as ta
+
+# ====================== UPDATED INDICATOR CALCULATION ======================
+def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes technical indicators with robust validation and fallbacks"""
+    if df is None or df.empty or not {'open', 'high', 'low', 'close'}.issubset(df.columns):
+        logger.error("Invalid DataFrame for indicator calculation")
+        return pd.DataFrame()
+
+    try:
+        # Convert and validate core columns
+        numeric_cols = ['open', 'high', 'low', 'close']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+        df = df.ffill().bfill().dropna(subset=numeric_cols)
+        
+        if len(df) < 20:  # Minimum data for reliable indicators
+            logger.warning("Insufficient data length for indicators")
+            return df
+
+        close = df['close']
+        high = df['high']
+        low = df['low']
+
+        # RSI with fallback to SMA crossover
+        try:
+            df['RSI_14'] = ta.rsi(close, length=14).fillna(50)
+        except Exception:
+            sma50 = ta.sma(close, length=50)
+            sma200 = ta.sma(close, length=200)
+            df['RSI_14'] = np.where(sma50 > sma200, 60, 40)
+
+        # ATR with volatility check
+        try:
+            df['ATR_14'] = ta.atr(high, low, close, length=14).fillna(close * 0.01)
+            df['ATR_14'] = np.where(df['ATR_14'] < (close * 0.005), close * 0.01, df['ATR_14'])
+        except Exception:
+            df['ATR_14'] = close.rolling(14).std().fillna(close * 0.02)
+
+        # Bollinger Bands with price position
+        try:
+            bb = ta.bbands(close, length=20, std=2)
+            df = df.join(bb, rsuffix='_BB')
+            df['BB_WIDTH'] = (df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']
+        except Exception:
+            df['BB_WIDTH'] = 0
+
+        # ADX/Directional Movement
+        try:
+            adx = ta.adx(high, low, close, length=14)
+            df = df.join(adx[['ADX_14', 'DMP_14', 'DMN_14']])
+            df['+DI_14'] = df['DMP_14'].fillna(25)
+            df['-DI_14'] = df['DMN_14'].fillna(25)
+        except Exception:
+            df['ADX_14'] = 25
+            df['+DI_14'] = 25
+            df['-DI_14'] = 25
+
+        # Cleanup and final validation
+        df = df.drop(columns=[c for c in ['DMP_14', 'DMN_14'] if c in df.columns])
+        return df.ffill().bfill().dropna(how='all', axis=1)
+
+    except Exception as e:
+        logger.error(f"Critical indicator failure: {str(e)}")
+        return pd.DataFrame()
+
+# ====================== UPDATED TRADE LEVEL CALCULATION ======================
+def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
+    """Calculates trade levels with broker-specific validation"""
+    try:
+        if not MT5_AVAILABLE or not mt5.initialize():
+            initialize_mt5_admin()
+
+        mt5_symbol = symbol.replace("/", "")
+        symbol_info = mt5.symbol_info(mt5_symbol)
+        digits = 5
+        min_stop_distance = 0
+        point_value = 0.00001
+
+        if symbol_info:
+            digits = symbol_info.digits
+            point_value = symbol_info.point
+            min_stop_points = symbol_info.stops_level
+            min_stop_distance = min_stop_points * point_value * 1.2  # 20% buffer
+            trade_allowed = symbol_info.trade_allowed
+            if not trade_allowed:
+                logger.error(f"Trading disabled for {symbol}")
+                raise ValueError("Symbol trading disabled")
+
+        # Validate ATR against minimum stop distance
+        atr = max(atr, min_stop_distance * 1.5)
+        price = round(price, digits)
+
+        if side.upper() == "BUY":
+            raw_sl = price - atr
+            sl = max(raw_sl, price - (price * 0.05))  # Max 5% risk
+            sl = round(sl - (min_stop_distance * 0.5), digits)  # Add buffer
+            tp_levels = [round(price + (atr * mult), digits) for mult in [1, 2, 3]]
+        else:
+            raw_sl = price + atr
+            sl = min(raw_sl, price + (price * 0.05))
+            sl = round(sl + (min_stop_distance * 0.5), digits)
+            tp_levels = [round(price - (atr * mult), digits) for mult in [1, 2, 3]]
+
+        # Final validation against current price
+        if side == "BUY" and sl >= price - min_stop_distance:
+            sl = round(price - min_stop_distance * 1.5, digits)
+        elif side == "SELL" and sl <= price + min_stop_distance:
+            sl = round(price + min_stop_distance * 1.5, digits)
+
+        return {
+            "sl_level": sl,
+            "tp_levels": tp_levels,
+            "min_stop": min_stop_distance
+        }
+
+    except Exception as e:
+        logger.error(f"Level calculation critical error: {str(e)}")
+        return {
+            "sl_level": round(price * 0.99, 5),
+            "tp_levels": [round(price * 1.01, 5), round(price * 1.02, 5)],
+            "min_stop": 0
+        }
+    
 def generate_institutional_predictions(df: pd.DataFrame) -> dict:
     predictions = {}
     try:
         ml_data = prepare_features(df, "ml")
         dl_data = prepare_features(df, "dl")
         rl_data = prepare_features(df, "rl")
-        
+
         if dl_data is not None:
             for model in ["lstm", "gru", "transformer", "cnn"]:
                 if model in models:
                     try:
-                        predictions[model] = float(models[model].predict(dl_data)[0][0])
+                        pred_val = models[model].predict(dl_data)
+                        predictions[model] = float(pred_val[0][0])
                     except Exception as e:
                         logger.error(f"{model} prediction failed: {str(e)}")
                         predictions[model] = 0
+
         if ml_data is not None:
             for model in ["xgb", "lightgbm", "catboost", "svr", "stacking", "gaussian"]:
                 if model in models:
                     try:
-                        pred = models[model].predict(ml_data)
-                        predictions[model] = float(pred[0])
+                        pred_val = models[model].predict(ml_data)
+                        predictions[model] = float(pred_val[0])
                     except Exception as e:
                         logger.error(f"{model} prediction failed: {str(e)}")
                         predictions[model] = 0
+
         if rl_data is not None:
             for model in ["dqn", "ppo"]:
                 if model in models:
@@ -1256,6 +1508,7 @@ def generate_institutional_predictions(df: pd.DataFrame) -> dict:
                     except Exception as e:
                         logger.error(f"{model} RL prediction failed: {str(e)}")
                         predictions[model] = 0
+
         if "prophet" in models and not df.empty:
             try:
                 if 'timestamp' not in df.columns:
@@ -1263,128 +1516,195 @@ def generate_institutional_predictions(df: pd.DataFrame) -> dict:
                 prophet_df = df[['timestamp', 'close']].rename(columns={'timestamp': 'ds', 'close': 'y'})
                 future = models["prophet"].make_future_dataframe(periods=1, freq='min')
                 forecast = models["prophet"].predict(future)
-                predictions["prophet"] = forecast['yhat'].iloc[-1]
+                predictions["prophet"] = float(forecast['yhat'].iloc[-1])
             except Exception as e:
                 logger.error(f"Prophet prediction failed: {str(e)}")
                 predictions["prophet"] = 0
+
     except Exception as e:
         logger.error(f"Prediction generation error: {str(e)}")
-    return predictions
 
+    return predictions
 
 def get_all_users():
     """Query the database to return all registered users."""
     with SessionLocal() as db:
         return db.query(User).all()
 
-def compute_trade_levels(price: float, atr: float, side: str) -> dict:
-    """Calculate stop loss and take profit levels based on ATR and volatility."""
-    if atr <= 0 or np.isnan(atr):
-        atr = price * 0.01  # Fallback ATR
-    volatility_ratio = atr / price
-    if volatility_ratio > 0.02:
-        multiplier = 1.0
-    elif volatility_ratio > 0.01:
-        multiplier = 1.5
-    else:
-        multiplier = 2.0
-    adjusted_atr = atr * multiplier
-    if side == "BUY":
-        sl = price - adjusted_atr
-        sl = max(sl, price * 0.995)  # Ensure SL is at least 0.5% below price
-        tp_levels = [max(price + adjusted_atr * i, price * 1.005) for i in [1, 2, 3]]
-    else:  # SELL
-        sl = price + adjusted_atr
-        sl = min(sl, price * 1.005)  # Ensure SL is at least 0.5% above price
-        tp_levels = [max(price - adjusted_atr * i, 0.00001) for i in [1, 2, 3]]
-    return {"sl_level": sl, "tp_levels": tp_levels}
-
-def safe_predictions(predictions: dict) -> dict:
-    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
-    fallback = {
-        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
-        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
-        "stacking": 0, "gaussian": 0, "prophet": 0
-    }
-    safe_preds = {}
-    for key, fb in fallback.items():
-        try:
-            val = predictions.get(key, fb)
-            if not isinstance(val, (int, float)) or np.isnan(val):
-                safe_preds[key] = fb
-            else:
-                safe_preds[key] = val
-        except Exception:
-            safe_preds[key] = fb
-    return safe_preds
-
-def safe_predictions(predictions: dict) -> dict:
-    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
-    fallback = {
-        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
-        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
-        "stacking": 0, "gaussian": 0, "prophet": 0
-    }
-    safe_preds = {}
-    for key, fb in fallback.items():
-        try:
-            val = predictions.get(key, fb)
-            if not isinstance(val, (int, float)) or np.isnan(val):
-                safe_preds[key] = fb
-            else:
-                safe_preds[key] = val
-        except Exception:
-            safe_preds[key] = fb
-    return safe_preds
-
-def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: str) -> dict:
+def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
     """
-    Generate a trade signal based on market data and technical indicators.
-    Uses SMA, ADX, and DI values to determine whether to BUY or SELL.
+    Calculates stop loss (SL) and take profit (TP) levels ensuring that stops meet broker minimum requirements.
+    Uses a fallback ATR if the computed ATR is invalid.
     """
     try:
-        price = df["close"].iloc[-1]
-    except Exception:
-        price = 150.0
-    atr = df["ATR_14"].iloc[-1] if "ATR_14" in df.columns else price * 0.01
-    adx = df["ADX_14"].iloc[-1] if "ADX_14" in df.columns else 0.0
-    di_plus = df["+DI_14"].iloc[-1] if "+DI_14" in df.columns else 0.0
-    di_minus = df["-DI_14"].iloc[-1] if "-DI_14" in df.columns else 0.0
+        price = float(price)
+        atr = float(atr)
+        if atr <= 0 or pd.isna(atr):
+            atr = price * 0.01  # Fallback ATR
 
+        # Default precision and minimum stop distance
+        digits = 5  
+        min_stop_distance = price * 0.005
+
+        if MT5_AVAILABLE:
+            mt5_symbol = symbol.replace("/", "")
+            symbol_info = mt5.symbol_info(mt5_symbol)
+            if symbol_info:
+                digits = getattr(symbol_info, "digits", 5)
+                stops_level = getattr(symbol_info, "stops_level", 10)
+                point = getattr(symbol_info, "point", 0.00001)
+                min_stop_distance = stops_level * point
+
+        if side.upper() == "BUY":
+            sl = price - max(atr, min_stop_distance)
+            tp_levels = [price + atr, price + 2 * atr, price + 3 * atr]
+        else:
+            sl = price + max(atr, min_stop_distance)
+            tp_levels = [price - atr, price - 2 * atr, price - 3 * atr]
+
+        return {
+            "sl_level": round(sl, digits),
+            "tp_levels": [round(tp, digits) for tp in tp_levels]
+        }
+    except Exception as e:
+        logger.error(f"Trade level calculation error: {str(e)}")
+        fallback_sl = round(price * 0.99 if side.upper() == "BUY" else price * 1.01, 5)
+        fallback_tp = [
+            round(price * 1.02 if side.upper() == "BUY" else price * 0.98, 5),
+            round(price * 1.03 if side.upper() == "BUY" else price * 0.97, 5)
+        ]
+        return {"sl_level": fallback_sl, "tp_levels": fallback_tp}
+
+def safe_predictions(predictions: dict) -> dict:
+    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
+    fallback = {
+        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
+        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
+        "stacking": 0, "gaussian": 0, "prophet": 0
+    }
+    safe_preds = {}
+    for key, fb in fallback.items():
+        try:
+            val = predictions.get(key, fb)
+            if not isinstance(val, (int, float)) or np.isnan(val):
+                safe_preds[key] = fb
+            else:
+                safe_preds[key] = val
+        except Exception:
+            safe_preds[key] = fb
+    return safe_preds
+
+def safe_predictions(predictions: dict) -> dict:
+    """
+    Ensures that all model prediction values are valid numbers.
+    If any value is invalid or NaN, it falls back to 0.
+    """
+    fallback = {
+        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
+        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
+        "stacking": 0, "gaussian": 0, "prophet": 0
+    }
+    safe_preds = {}
+    for key, fb in fallback.items():
+        try:
+            val = predictions.get(key, fb)
+            # If the value is a pandas Series, extract the last element.
+            if isinstance(val, pd.Series):
+                val = val.iloc[-1]
+            if not isinstance(val, (int, float)) or (isinstance(val, float) and pd.isna(val)):
+                safe_preds[key] = fb
+            else:
+                safe_preds[key] = float(val)
+        except Exception:
+            safe_preds[key] = fb
+    return safe_preds
+
+# =====================================================================
+# INSTITUTIONAL SIGNAL GENERATION WITH VALIDATED TRADE LEVELS
+# =====================================================================
+# ====================== SIGNAL GENERATION CORE ======================
+# ====================== ENHANCED SIGNAL GENERATION ======================
+def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: str) -> dict:
+    """Generates trading signals with improved validation and logging"""
     signal = {
         "asset": asset,
         "action": "HOLD",
-        "price": price,
+        "price": 0.0,
         "confidence": 0,
         "timestamp": datetime.utcnow().isoformat(),
-        "indicators": {
-            "RSI_14": df["RSI_14"].iloc[-1] if "RSI_14" in df.columns else None,
-            "ATR_14": atr,
-            "ADX_14": adx,
-            "+DI_14": di_plus,
-            "-DI_14": di_minus,
-        },
+        "indicators": {},
         "predictions": predictions,
         "tp_levels": [],
-        "sl_level": None,
+        "sl_level": None
     }
-    # Use a simple indicator: if current price is above SMA_50 and ADX > 25 with DI+ > DI- then BUY,
-    # if below SMA_50 with ADX > 25 and DI- > DI+ then SELL; otherwise HOLD.
-    sma = df["SMA_50"].iloc[-1] if "SMA_50" in df.columns else price
-    if price > sma and adx > 25 and di_plus > di_minus:
-        action = "BUY"
-    elif price < sma and adx > 25 and di_minus > di_plus:
-        action = "SELL"
-    else:
-        action = "HOLD"
-    if action != "HOLD":
-        levels = compute_trade_levels(price, atr, action)
+
+    try:
+        # Validate input data
+        if df.empty or 'close' not in df.columns:
+            logger.error(f"Invalid data for {asset}")
+            return signal
+
+        required_indicators = ['RSI_14', 'ADX_14', '+DI_14', '-DI_14', 'ATR_14']
+        if not all(ind in df.columns for ind in required_indicators):
+            logger.warning(f"Missing indicators for {asset}")
+            return signal
+
+        # Get latest values
+        latest = df.iloc[-1]
+        price = latest['close']
+        rsi = latest['RSI_14']
+        adx = latest['ADX_14']
+        di_plus = latest['+DI_14']
+        di_minus = latest['-DI_14']
+        atr = latest['ATR_14']
+
         signal.update({
-            "action": action,
-            "sl_level": levels["sl_level"],
-            "tp_levels": levels["tp_levels"],
-            "confidence": 90  # Example fixed confidence value
+            "price": price,
+            "indicators": {
+                "RSI_14": rsi,
+                "ADX_14": adx,
+                "+DI_14": di_plus,
+                "-DI_14": di_minus,
+                "ATR_14": atr
+            }
         })
+
+        # Generate Signal Logic
+        buy_condition = (
+            price > df['SMA_50'].iloc[-1] and
+            adx > 20 and
+            di_plus > di_minus + 2 and
+            rsi < 65
+        )
+
+        sell_condition = (
+            price < df['SMA_50'].iloc[-1] and
+            adx > 20 and
+            di_minus > di_plus + 2 and
+            rsi > 35
+        )
+
+        if buy_condition:
+            signal.update({
+                "action": "BUY",
+                "confidence": min(90 + (adx - 20) * 2, 95)
+            })
+            logger.info(f"Generated BUY signal for {asset}")
+            
+        elif sell_condition:
+            signal.update({
+                "action": "SELL", 
+                "confidence": min(90 + (adx - 20) * 2, 95)
+            })
+            logger.info(f"Generated SELL signal for {asset}")
+
+        # Add trade levels even for HOLD for monitoring
+        levels = compute_trade_levels(price, atr, signal["action"], asset)
+        signal.update(levels)
+
+    except Exception as e:
+        logger.error(f"Signal generation failed for {asset}: {str(e)}")
+
     return signal
 
 def is_forex_trading_hours() -> bool:
@@ -1470,7 +1790,7 @@ async def switch_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                     payload = {
                         "chat_id": TELEGRAM_CHANNEL_ID,
                         "text": f"🔔 Mode changed to {mode.upper()} via user command\nActive assets: {', '.join(assets)}",
-                        "parse_mode": "Markdown"
+                        "parse_mode": "HTML"
                     }
                     async with session.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload
@@ -1527,7 +1847,7 @@ async def telegram_webhook(request: Request):
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {"chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"}
+            payload = {"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"}
             await session.post(url, json=payload)
     except Exception as e:
         logger.error(f"Telegram response error: {str(e)}")
@@ -1589,27 +1909,53 @@ async def start_telegram_listener():
 async def shutdown_telegram():
     global telegram_app
     if telegram_app:
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+        try:
+            await telegram_app.stop()
+        except RuntimeError as e:
+            logger.warning(f"Telegram app stop error: {str(e)}")
+        try:
+            await telegram_app.shutdown()
+        except Exception as e:
+            logger.warning(f"Telegram app shutdown error: {str(e)}")
         telegram_app = None
         logger.info("Telegram listener stopped")
+    else:
+        logger.info("Telegram listener was not running")
 
-async def send_telegram_message(chat_id: str, payload: dict, retries: int = 3):
-    for attempt in range(retries):
+async def send_telegram_message(dest: str, payload: dict):
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            async with session.post(url, json=payload) as response:
+                response_text = await response.text()
+                if response.status != 200:
+                    logger.error(f"Failed to send message to {dest}: {response_text}")
+                else:
+                    logger.debug(f"Message sent to {dest} successfully.")
+    except Exception as e:
+        logger.error(f"Error sending message to {dest}: {str(e)}")
+
+import aiohttp
+
+async def _send_telegram_with_retry(payload: dict, max_retries: int = 2) -> bool:
+    """
+    Sends a Telegram message with retries using HTML parse mode to avoid markdown entity issues.
+    """
+    for attempt in range(max_retries + 1):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                async with session.post(url, json=payload, timeout=10) as response:
+                # It's recommended to format your message text for HTML if switching parse_mode.
+                async with session.post(url, json=payload) as response:
                     if response.status == 200:
-                        logger.info(f"Telegram message sent to {chat_id}")
-                        return await response.text()
-                    else:
-                        logger.warning(f"Attempt {attempt+1}: Telegram returned status {response.status}")
+                        return True
+                    logger.warning(f"Telegram attempt {attempt+1} failed: {await response.text()}")
         except Exception as e:
-            logger.error(f"Telegram send attempt {attempt+1} failed: {str(e)}")
-        await asyncio.sleep(2 ** attempt)
-    logger.error("All telegram send attempts failed")
-    return None
+            logger.warning(f"Telegram send error (attempt {attempt+1}): {str(e)}")
+        if attempt < max_retries:
+            await asyncio.sleep(0.5)
+    logger.error(f"Failed to send Telegram notification after {max_retries} retries")
+    return False
 
 async def send_pre_signal_message(signal: dict):
     signal_id = signal.get("id")
@@ -1625,14 +1971,19 @@ async def send_pre_signal_message(signal: dict):
     payload = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_notification": False
     }
     await send_telegram_message(TELEGRAM_CHANNEL_ID, payload)
 
 async def send_telegram_alert(signal: dict):
+    """
+    Sends a formatted trade signal alert via Telegram.
+    Ensures duplicate signals are not re-sent and logs any errors.
+    """
     signal_id = signal.get("id")
     if signal_id in sent_alert_ids:
+        logger.debug(f"Signal {signal_id} already sent; skipping duplicate.")
         return
     sent_alert_ids.add(signal_id)
     try:
@@ -1664,20 +2015,23 @@ async def send_telegram_alert(signal: dict):
             "┃   NekoAIBot - Next-Gen Trading   ┃\n"
             "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         )
+        # Send to both chat and channel
         destinations = [TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID]
         for dest in destinations:
             if not dest:
+                logger.debug("Destination not set; skipping.")
                 continue
             payload = {
                 "chat_id": dest,
                 "text": message,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True
             }
+            logger.debug(f"Sending Telegram alert to {dest}: {message}")
             await send_telegram_message(dest, payload)
     except Exception as e:
         logger.error(f"Alert system error: {str(e)}")
-
+        
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1722,7 +2076,7 @@ async def test_telegram():
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "🔧 System Test Message", "parse_mode": "Markdown"}
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "🔧 System Test Message", "parse_mode": "HTML"}
             async with session.post(url, json=payload) as response:
                 return {"status": response.status, "response": await response.text()}
     except Exception as e:
@@ -1786,104 +2140,156 @@ class AsyncPositionTracker:
 # Initialize global tracker
 position_tracker = AsyncPositionTracker()
 
-async def place_mt5_order(symbol: str, order_type: str, volume: float, price: float, 
-                            signal_id: str, user: Optional[User] = None,
-                            sl_level: Optional[float] = None, 
-                            tp_levels: Optional[List[float]] = None):
+# =====================================================================
+# AUTOMATIC LOT SIZE CALCULATION
+# =====================================================================
+# ================= Order Placement Function =================
+def calculate_lot_size(symbol: str, entry_price: float, sl_level: float) -> float:
+    """
+    Calculates lot size based on account balance, a fixed risk per trade,
+    and the distance between entry price and stop loss.
+    """
+    try:
+        if not MT5_AVAILABLE:
+            return 0.01
+        account = mt5.account_info()
+        if account is None:
+            return 0.01
+        balance = account.balance
+        risk_amount = balance * RISK_PER_TRADE
+        risk_per_lot = abs(entry_price - sl_level)
+        if risk_per_lot == 0:
+            return 0.01
+        raw_volume = risk_amount / risk_per_lot
+        symbol_info = mt5.symbol_info(symbol.replace("/", ""))
+        if symbol_info:
+            volume = max(raw_volume, symbol_info.volume_min)
+            step = symbol_info.volume_step
+            volume = round(volume / step) * step
+            return volume
+        return raw_volume
+    except Exception as e:
+        logger.error(f"Lot size calculation error: {str(e)}")
+        return 0.01
+
+import asyncio
+
+# ====================== UPDATED ORDER EXECUTION ======================
+async def place_mt5_order(
+    symbol: str,
+    order_type: str,
+    volume: float,
+    price: float,
+    signal_id: str,
+    user: Optional[User] = None,
+    sl_level: Optional[float] = None,
+    tp_levels: Optional[List[float]] = None
+):
+    """Enhanced order placement with comprehensive validation"""
     max_attempts = 3
     attempt = 0
-    while attempt < max_attempts:
-        try:
-            if user:
-                with SessionLocal() as db:
-                    if not initialize_user_mt5(user, db):
-                        logger.error(f"User MT5 init failed for {user.username}")
-                        return None
-            elif not initialize_mt5_admin():
-                logger.error("Global MT5 init failed")
-                return None
 
-            mt5_symbol = symbol.replace("/", "")
-            if MT5_AVAILABLE and not mt5.symbol_select(mt5_symbol, True):
-                logger.error(f"Symbol {mt5_symbol} not available")
-                return None
+    try:
+        if not is_market_open(symbol):
+            logger.error(f"Market closed for {symbol}")
+            return None
 
-            tick = mt5.symbol_info_tick(mt5_symbol)
-            if not tick:
-                logger.error("No tick data available")
-                raise Exception("No tick data")
+        while attempt < max_attempts:
+            try:
+                # Initialize connection
+                if user:
+                    with SessionLocal() as db:
+                        if not initialize_user_mt5(user, db):
+                            raise Exception("User MT5 init failed")
+                elif not initialize_mt5_admin():
+                    raise Exception("Global MT5 init failed")
 
-            current_price = tick.ask if order_type == "BUY" else tick.bid
-            price_diff = abs(current_price - price) / price
-            if price_diff > 0.01:
-                logger.warning(f"Price deviation too large: {price_diff:.2%}")
-                return None
+                # Symbol validation
+                mt5_symbol = symbol.replace("/", "")
+                if not mt5.symbol_select(mt5_symbol, True):
+                    logger.error(f"Symbol {mt5_symbol} not available")
+                    return None
 
-            # Adjust SL and TP levels according to the broker's minimum stop distance.
-            symbol_info = mt5.symbol_info(mt5_symbol)
-            if symbol_info:
-                min_stop_points = symbol_info.stops_level
-                point_value = symbol_info.point
-                min_stop_distance = min_stop_points * point_value
-                logger.info(f"Minimum stop distance for {mt5_symbol}: {min_stop_distance}")
+                symbol_info = mt5.symbol_info(mt5_symbol)
+                if not symbol_info or not symbol_info.trade_allowed:
+                    logger.error(f"Trading disabled for {symbol}")
+                    return None
 
-                if sl_level is not None:
-                    if order_type == "BUY" and (current_price - sl_level) < min_stop_distance:
-                        logger.info(f"Adjusting SL for BUY: {sl_level} -> {current_price - min_stop_distance}")
-                        sl_level = current_price - min_stop_distance
-                    elif order_type == "SELL" and (sl_level - current_price) < min_stop_distance:
-                        logger.info(f"Adjusting SL for SELL: {sl_level} -> {current_price + min_stop_distance}")
-                        sl_level = current_price + min_stop_distance
-                    sl_level = round(sl_level, symbol_info.digits)
+                # Price validation
+                tick = mt5.symbol_info_tick(mt5_symbol)
+                if not tick:
+                    logger.error("No tick data available")
+                    raise Exception("No market data")
 
-                if tp_levels:
-                    adjusted_tps = []
-                    for tp in tp_levels:
-                        if order_type == "BUY" and (tp - current_price) < min_stop_distance:
-                            logger.info(f"Adjusting TP for BUY: {tp} -> {current_price + min_stop_distance}")
-                            tp = current_price + min_stop_distance
-                        elif order_type == "SELL" and (current_price - tp) < min_stop_distance:
-                            logger.info(f"Adjusting TP for SELL: {tp} -> {current_price - min_stop_distance}")
-                            tp = current_price - min_stop_distance
-                        adjusted_tps.append(round(tp, symbol_info.digits))
-                    tp_levels = adjusted_tps
+                current_price = tick.ask if order_type.upper() == "BUY" else tick.bid
+                price_diff = abs(current_price - price) / price
+                if price_diff > 0.01:
+                    logger.warning(f"Large price deviation: {price_diff:.2%}")
+                    price = current_price
 
-                # Validate volume against the broker's minimum allowed volume.
-                if symbol_info.volume_min and volume < symbol_info.volume_min:
-                    logger.info(f"Volume {volume} below minimum {symbol_info.volume_min}, adjusting to minimum.")
-                    volume = symbol_info.volume_min
+                # Calculate levels if not provided
+                if not sl_level or not tp_levels:
+                    levels = compute_trade_levels(
+                        current_price, 
+                        symbol_info.point * 100,  # Fallback ATR
+                        order_type, 
+                        symbol
+                    )
+                    sl_level = levels["sl_level"]
+                    tp_levels = levels["tp_levels"]
 
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": mt5_symbol,
-                "volume": volume,
-                "type": mt5.ORDER_TYPE_BUY if order_type == "BUY" else mt5.ORDER_TYPE_SELL,
-                "price": current_price,
-                "deviation": 10,
-                "magic": 234000,
-                "comment": f"NEKO_{signal_id}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_FOK,
-            }
-            if sl_level is not None:
-                request["sl"] = sl_level
-            if tp_levels and len(tp_levels) > 0:
-                request["tp"] = tp_levels[0]
+                # Validate stop levels
+                min_stop = symbol_info.stops_level * symbol_info.point
+                if order_type == "BUY":
+                    stop_diff = current_price - sl_level
+                else:
+                    stop_diff = sl_level - current_price
 
-            result = mt5.order_send(request)
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Order failed: {result.comment}")
+                if stop_diff < min_stop:
+                    logger.warning(f"Stop too close: {stop_diff} < {min_stop}")
+                    sl_level = current_price - (min_stop * 1.5) if order_type == "BUY" \
+                              else current_price + (min_stop * 1.5)
+                    logger.info(f"Adjusted SL to {sl_level}")
+
+                # Prepare order request
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": mt5_symbol,
+                    "volume": max(volume, symbol_info.volume_min),
+                    "type": mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL,
+                    "price": current_price,
+                    "sl": sl_level,
+                    "tp": tp_levels[0] if tp_levels else None,
+                    "deviation": 10,
+                    "magic": 234000,
+                    "comment": f"NEKO_{signal_id}",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_FOK,
+                }
+
+                # Execute order
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(f"Order executed: {result.order}")
+                    return result
+                
+                logger.warning(f"Order failed: {result.comment}")
                 attempt += 1
                 await asyncio.sleep(2)
-                continue
 
-            return result
+            except Exception as e:
+                logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
+                attempt += 1
+                await asyncio.sleep(2)
 
-        except Exception as e:
-            logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
-            attempt += 1
-            await asyncio.sleep(2)
-    return None
+        logger.error(f"Failed all order attempts for {symbol}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Critical order error: {str(e)}")
+        return None
+    finally:
+        mt5.shutdown()
 
 # Dictionary to track active signals per asset (to allow one signal at a time)
 active_signals = {}
@@ -1892,57 +2298,57 @@ import asyncio
 import logging
 
 # New function to process signals and trigger trade execution
-async def process_signals_and_trade():
-    """
-    Process trade signals from the global signal_queue and execute orders.
-    This function also handles mode change events to ensure that trade signals are generated
-    and executed immediately after switching modes.
-    """
-    while not shutdown_flag.is_set():
-        try:
-            # Wait for the next signal from the queue.
-            signal = await signal_queue.get()
+async def process_trade_signal(signal: dict):
+    """Processes trade signals with adjusted volatility threshold"""
+    try:
+        logger.info(f"Processing {signal['asset']} {signal['action']} signal")
+        
+        # Adjusted volatility check (0.1% instead of 0.15%)
+        atr = signal["indicators"]["ATR_14"]
+        if atr < signal["price"] * 0.001:
+            logger.warning(f"Ignoring {signal['asset']} - low volatility (ATR: {atr:.5f})")
+            return
 
-            # If this is a mode change event, update the active asset universe and continue.
-            if signal.get("event") == "mode_change":
-                active_assets = get_asset_universe(force_refresh=True)
-                logger.info(f"Received mode change event. Active assets updated to: {active_assets}")
-                continue
+        # Generate unique signal ID
+        async with signal_counter_lock:
+            global signal_counter
+            signal_id = f"NEKO_{signal_counter}"
+            signal_counter += 1
+        signal["id"] = signal_id
 
-            # Retrieve asset information from the signal.
-            asset = signal.get("asset")
-            active_assets = get_asset_universe()
-            if asset is None or asset not in active_assets:
-                logger.info(f"Signal asset {asset} not in active assets {active_assets}. Ignoring signal.")
-                continue
+        # Pre-trade alert
+        await send_pre_signal_message(signal)
+        logger.info(f"Signal {signal_id} confirmed, executing in 30s")
+        await asyncio.sleep(30)
 
-            # Optionally, log the incoming signal for debugging.
-            logger.info(f"Processing trade signal for {asset}: {signal}")
+        # Execute trade
+        levels = compute_trade_levels(
+            signal["price"],
+            signal["indicators"]["ATR_14"],
+            signal["action"],
+            signal["asset"]
+        )
+        
+        result = await place_mt5_order(
+            symbol=signal["asset"],
+            order_type=signal["action"],
+            volume=0.1,
+            price=signal["price"],
+            signal_id=signal_id,
+            sl_level=levels["sl_level"],
+            tp_levels=levels["tp_levels"]
+        )
 
-            # Send a pre-signal alert to notify that a trade is about to be executed.
-            await send_pre_signal_message(signal)
-            logger.info(f"Pre-signal alert sent for signal {signal.get('id', 'N/A')}. Waiting 30 seconds before executing trade...")
-            await asyncio.sleep(30)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            await send_telegram_alert(signal)
+            logger.info(f"Trade executed: {signal_id}")
+            # Track position
+            await position_tracker.add_position(result)
+        else:
+            logger.error(f"Execution failed for {signal_id}")
 
-            # Attempt to place the MT5 order using details from the signal.
-            result = await place_mt5_order(
-                symbol=asset,
-                order_type=signal.get("action"),   # e.g., "BUY" or "SELL"
-                volume=0.1,                         # Adjust as needed or derive from signal
-                price=signal.get("price"),
-                signal_id=signal.get("id", "unknown"),
-                sl_level=signal.get("sl_level"),
-                tp_levels=signal.get("tp_levels")
-            )
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Trade execution failed for {asset}")
-            else:
-                logger.info(f"Trade executed successfully for {asset}")
-
-        except Exception as e:
-            logger.error(f"Error in processing trade signal: {str(e)}")
-        # Brief pause before checking for the next signal.
-        await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"Trade processing failed: {str(e)}")
 
 def adjust_stop_loss(position, signal):
     """
@@ -2086,61 +2492,104 @@ async def calculate_volatility_adjusted_sizes(assets):
             sizes.append(0.1)
     return sizes
 
+# ====================== TRADING WORKER IMPROVEMENTS ======================
+# ====================== IMPROVED TRADING WORKER ======================
 async def premium_trading_worker():
-    try:
-        while not shutdown_flag.is_set():
-            # Retrieve the current asset universe (either forex or crypto based on mode)
-            assets = get_asset_universe(force_refresh=False)
-            logger.info(f"Premium trading worker processing assets: {assets}")
+    """Enhanced trading loop with explicit signal generation checks"""
+    while not shutdown_flag.is_set():
+        try:
+            assets = get_asset_universe()
+            logger.info(f"Processing {len(assets)} assets")
             
             for asset in assets:
-                # Determine asset type explicitly
-                asset_type = "crypto" if asset in ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"] else "forex"
                 try:
-                    # Resiliently fetch market data using TwelveData API (with retry logic)
-                    market_data = await fetch_twelvedata(asset, asset_type)
-                    if market_data is None or market_data.empty:
-                        logger.warning(f"No market data available for {asset}. Skipping trade.")
+                    # Get fresh data with validation
+                    asset_type = "crypto" if "/USD" in asset else "forex"
+                    data = await fetch_market_data(asset, asset_type)
+                    
+                    if data.empty or len(data) < 100:
+                        logger.warning(f"Skipping {asset} - insufficient data")
                         continue
-
-                    # Compute technical indicators on the retrieved market data
-                    data_with_indicators = compute_professional_indicators(market_data)
-
-                    # Generate predictions from institutional models (ML, DL, RL, Prophet, etc.)
-                    predictions = generate_institutional_predictions(data_with_indicators)
-
-                    # Generate a trade signal (BUY, SELL, or HOLD) based on the data and predictions
-                    signal = generate_institutional_signal(data_with_indicators, predictions, asset)
-                    logger.info(f"Generated signal for {asset}: {signal}")
-
+                        
+                    # Generate predictions
+                    predictions = generate_institutional_predictions(data)
+                    if not predictions:
+                        logger.warning(f"No predictions for {asset}")
+                        continue
+                        
+                    # Generate signal
+                    signal = generate_institutional_signal(data, predictions, asset)
+                    
+                    # Process valid signals
                     if signal["action"] != "HOLD":
-                        # Execute order if signal is actionable (BUY or SELL)
-                        order_result = await place_mt5_order(
-                            symbol=asset,
-                            order_type=signal["action"],
-                            volume=0.1,  # Example position size; adjust as needed
-                            price=signal["price"],
-                            signal_id=f"signal_{asset}",
-                            sl_level=signal.get("sl_level"),
-                            tp_levels=signal.get("tp_levels")
-                        )
-                        if order_result is None:
-                            logger.error(f"Order execution failed for {asset}")
-                        else:
-                            logger.info(f"Trade executed for {asset}: {order_result.comment}")
+                        logger.info(f"Processing {asset} {signal['action']} signal")
+                        
+                        # Add news sentiment analysis
+                        news = await fetch_market_news(asset_type)
+                        signal["news_sentiment"] = analyze_sentiment(news)
+                        
+                        # Enqueue for processing
+                        await signal_queue.put(signal)
+                        await process_trade_signal(signal)
+                        
+                        # Temporary cooldown
+                        await asyncio.sleep(5)
+                        
                     else:
-                        logger.info(f"HOLD signal for {asset}. No action taken.")
+                        logger.debug(f"No action for {asset}")
+
                 except Exception as e:
-                    logger.error(f"Error processing asset {asset}: {str(e)}")
+                    logger.error(f"Asset {asset} error: {str(e)}")
 
-            # Periodically trigger the retraining cycle (only if valid training data is available)
-            await retraining_cycle()
-            # Wait for 30 seconds before processing the next cycle of trades
+            # Full cycle complete
+            logger.info("Completed asset scan cycle")
             await asyncio.sleep(30)
-    except asyncio.CancelledError:
-        logger.info("Premium trading worker task cancelled gracefully.")
-        raise
 
+        except Exception as e:
+            logger.error(f"Trading loop error: {str(e)}")
+            await asyncio.sleep(60)
+
+# ====================== ENHANCED LOGGING ======================
+async def process_trade_signal(signal: dict):
+    """Improved trade processing with detailed logging"""
+    try:
+        logger.info(f"Processing signal: {signal['asset']} {signal['action']}")
+        
+        # Generate unique ID
+        async with signal_counter_lock:
+            global signal_counter
+            signal_id = f"NEKO_{signal_counter}"
+            signal_counter += 1
+        signal["id"] = signal_id
+
+        # Pre-trade alert
+        logger.info(f"Signal {signal_id} confirmed")
+        await send_pre_signal_message(signal)
+        
+        # Execute after cooldown
+        logger.info(f"Executing {signal_id} in 30s")
+        await asyncio.sleep(30)
+
+        # Execute trade
+        result = await place_mt5_order(
+            symbol=signal["asset"],
+            order_type=signal["action"],
+            volume=0.1,
+            price=signal["price"],
+            signal_id=signal_id,
+            sl_level=signal.get("sl_level"),
+            tp_levels=signal.get("tp_levels")
+        )
+
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"Trade executed: {signal_id}")
+            await send_telegram_alert(signal)
+        else:
+            logger.error(f"Execution failed for {signal_id}")
+
+    except Exception as e:
+        logger.error(f"Trade processing failed: {str(e)}")
+        
 @app.on_event("shutdown")
 async def shutdown():
     shutdown_flag.set()
@@ -2391,7 +2840,7 @@ async def monitor_executed_trades(executions: list, original_signal: dict):
                 async with aiohttp.ClientSession() as session:
                     await session.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        json={"chat_id": TELEGRAM_CHANNEL_ID, "text": message, "parse_mode": "Markdown"}
+                        json={"chat_id": TELEGRAM_CHANNEL_ID, "text": message, "parse_mode": "HTML"}
                     )
             except Exception as e:
                 logger.error(f"Monitoring update failed: {str(e)}")
@@ -2513,183 +2962,135 @@ def load_all_models():
                     logger.error("Note: RL models may require retraining with the current feature set.")
     return models
 
+import gym
+from stable_baselines3.common.monitor import Monitor
 
 ###############################################################################
 # Updated RetrainRLSystem Class
 ###############################################################################
+# ================= RetrainRLSystem Class =================
+import time
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import logging
+import yfinance as yf
+import gym
+from stable_baselines3 import DQN, PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+logger = logging.getLogger(__name__)
+
+# ---------- RetrainRLSystem CLASS ----------
 class RetrainRLSystem:
-    def __init__(self, main_app):
-        self.main_app = main_app
-        self.training_lock = asyncio.Lock()
-        self.best_model = None
-        self.best_score = -np.inf
-        self.model_versions = []
-        # Policy kwargs (builds a model expecting 30 features)
-        self.policy_kwargs = {
-            'net_arch': [64, 64]
-        }
+    def __init__(self, app, retraining_interval: int = 3600, monitoring_interval: int = 300):
+        """
+        Initializes the retraining system.
+        
+        :param app: The FastAPI app instance (or similar) where market data, validation data, and models are stored.
+        :param retraining_interval: Interval in seconds between retraining cycles.
+        :param monitoring_interval: Interval in seconds between performance monitoring cycles.
+        """
+        self.app = app
+        self.retraining_interval = retraining_interval
+        self.monitoring_interval = monitoring_interval
+
+    def preprocess_training_data(self) -> pd.DataFrame:
+        """
+        Collects and preprocesses the training data for the RL models.
+        Replace this with your actual preprocessing logic.
+        
+        :return: A preprocessed pandas DataFrame with training data.
+        """
+        data = self.app.get_recent_data()
+        if data is None or data.empty:
+            logger.error("Preprocessing error: training data is empty.")
+            return pd.DataFrame()
+        
+        if 'close' not in data.columns:
+            logger.error("Preprocessing error: 'close' column missing from training data.")
+            return pd.DataFrame()
+
+        # Example preprocessing: drop rows with missing values
+        data = data.dropna()
+        return data
+
+    def retrain_models(self, data: pd.DataFrame):
+        """
+        Retrains each RL model using the provided training data.
+        Replace the placeholder retraining logic with your actual model retraining code.
+        
+        :param data: Preprocessed training data.
+        """
+        rl_models = self.app.models.get("rl", {})
+        if not rl_models:
+            logger.warning("No RL models available for retraining.")
+            return
+        
+        for model_name, model in rl_models.items():
+            try:
+                # Replace model.retrain(data) with your actual retraining method.
+                model.retrain(data)
+                logger.info(f"Retrained model '{model_name}' successfully.")
+            except Exception as e:
+                logger.error(f"Failed to retrain model '{model_name}': {str(e)}")
 
     async def continuous_retraining_scheduler(self):
         """
-        Scheduler that continuously retrains the RL model.
-        Uses the global shutdown_flag.
+        Continuously runs the retraining cycle on a fixed interval.
+        Checks that the preprocessed training data is non-empty before retraining.
         """
-        while not shutdown_flag.is_set():
-            logger.info("Initiating retraining cycle...")
-            await self.retrain_rl_models()
-            logger.info("Retraining cycle completed")
-            await asyncio.sleep(21600)  # Wait 6 hours before next cycle
+        while True:
+            try:
+                data = self.preprocess_training_data()
+                if data.empty:
+                    logger.error("No training data available after preprocessing; skipping retraining cycle.")
+                else:
+                    self.retrain_models(data)
+                    logger.info("Retraining cycle completed.")
+            except Exception as e:
+                logger.error(f"Retraining error: {str(e)}")
+            await asyncio.sleep(self.retraining_interval)
 
     async def monitor_performance(self):
         """
-        Monitors RL model performance and triggers retraining if performance degrades.
-        This example checks performance every 24 hours.
-        """
-        while not shutdown_flag.is_set():
-            try:
-                # Replace with your actual data collection logic
-                historical = self.main_app.get_historical_data()  
-                recent = self.main_app.get_recent_data()          
-                if historical is None or historical.empty or recent is None or recent.empty:
-                    import yfinance as yf
-                    historical = yf.download("BTC-USD", period="60d", interval="15m")
-                    recent = yf.download("BTC-USD", period="7d", interval="1m")
-                data = self._preprocess_data(historical, recent)
-                if not data.empty and 'dqn' in self.main_app.models:
-                    performance = self.run_backtest(self.main_app.models['dqn'], data)
-                    logger.info(f"Current performance: {performance}")
-                    if performance['sharpe'] < 0.5:
-                        logger.warning("Performance degraded - retraining needed")
-                        await self.retrain_rl_models()
-                await asyncio.sleep(86400)  # Wait 24 hours
-            except Exception as e:
-                logger.error(f"Monitoring error: {str(e)}")
-                await asyncio.sleep(3600)
-
-    async def retrain_rl_models(self):
-        """
-        Retrains the RL model using collected data.
-        Replace data collection with your own logic.
-        """
-        async with self.training_lock:
-            try:
-                # Replace with your actual data collection methods
-                historical = self.main_app.get_historical_data()
-                recent = self.main_app.get_recent_data()
-                if historical is None or historical.empty or recent is None or recent.empty:
-                    import yfinance as yf
-                    historical = yf.download("BTC-USD", period="60d", interval="15m")
-                    recent = yf.download("BTC-USD", period="7d", interval="1m")
-                data = self._preprocess_data(historical, recent)
-                if data.empty:
-                    logger.error("No training data available")
-                    return
-
-                env = self._create_training_environment(data)
-                model = DQN(
-                    "MlpPolicy",
-                    env,
-                    policy_kwargs=self.policy_kwargs,
-                    verbose=0,
-                    tensorboard_log="./logs/"
-                )
-                model.learn(total_timesteps=100000)
-                performance = self.run_backtest(model, data)
-                if performance['sharpe'] > self.best_score:
-                    version = f"dqn_v{len(self.model_versions)+1}_{datetime.now():%Y%m%d%H%M}"
-                    model.save(f"models/{version}")
-                    self.main_app.models['dqn'] = model
-                    self.best_score = performance['sharpe']
-                    self.model_versions.append(version)
-                    logger.info(f"New model deployed: {version}")
-                else:
-                    logger.info("Model performance did not improve")
-                env.close()
-                del model
-            except Exception as e:
-                logger.error(f"Retraining failed: {str(e)}")
-                import traceback
-                traceback.print_exc()
-
-    def _preprocess_data(self, historical, recent):
-        """
-        Combines and cleans historical and recent data.
-        """
-        try:
-            combined = pd.concat([historical, recent])
-            combined = combined[~combined.index.duplicated(keep='last')]
-            required_cols = ['open', 'high', 'low', 'close', 'volume']
-            for col in required_cols:
-                if col not in combined.columns:
-                    combined[col] = np.nan
-            # Remove duplicate columns
-            combined = combined.loc[:, ~combined.columns.duplicated()]
-            return combined.ffill().bfill().dropna()
-        except Exception as e:
-            logger.error(f"Data cleaning failed: {str(e)}")
-            return pd.DataFrame()
-
-    def _create_training_environment(self, data):
-        """
-        Creates a validated training environment.
-        """
-        from stable_baselines3.common.monitor import Monitor
-        import gym
-
-        class ValidatedTradingEnv(DummyVecEnv):
-            def __init__(self, data):
-                super().__init__([lambda: Monitor(
-                    gym.make('TradingEnv-v0', 
-                           data=data,
-                           feature_dim=30,  # Adjust if your environment output needs to change
-                           initial_balance=100000,
-                           transaction_fee=0.001),
-                    filename=None
-                )])
-            
-            def step_wait(self):
-                obs, rewards, dones, infos = super().step_wait()
-                if obs.shape[1] != 30:
-                    raise ValueError(f"Invalid feature dimensions: {obs.shape}")
-                return obs, rewards, dones, infos
+        Monitors the performance of the RL models using a validation dataset.
+        This method retrieves validation data from the app (via a get_validation_data method) and
+        then evaluates each model using its evaluate_performance method.
         
-        return ValidatedTradingEnv(data)
-
-    def run_backtest(self, model, data):
+        Replace or adjust the validation data retrieval and performance evaluation logic as needed.
         """
-        Runs a simple backtest and returns performance metrics.
-        """
-        try:
-            env = self._create_training_environment(data)
-            model.set_env(env)
-            obs = env.reset()
-            for _ in range(1000):
-                action, _ = model.predict(obs)
-                obs, _, dones, _ = env.step(action)
-                if dones.all():
-                    break
-            equity = env.get_attr('equity_curve')[0]
-            sharpe = self._calculate_sharpe(equity)
-            max_dd = self._calculate_max_drawdown(equity)
-            return {'sharpe': sharpe, 'max_dd': max_dd}
-        except Exception as e:
-            logger.error(f"Backtest failed: {str(e)}")
-            return {'sharpe': -1, 'max_dd': 100}
+        while True:
+            try:
+                # Retrieve validation data from your app. Ensure that get_validation_data exists.
+                if hasattr(self.app, "get_validation_data"):
+                    val_data = self.app.get_validation_data()
+                else:
+                    logger.error("No validation data retrieval method found in app.")
+                    val_data = pd.DataFrame()
 
-    def _calculate_sharpe(self, equity):
-        returns = np.diff(equity) / equity[:-1]
-        return np.mean(returns) / np.std(returns) * np.sqrt(252)
+                if val_data is None or val_data.empty:
+                    logger.warning("No validation data available for performance monitoring.")
+                else:
+                    rl_models = self.app.models.get("rl", {})
+                    for model_name, model in rl_models.items():
+                        try:
+                            # Replace evaluate_performance with your actual performance evaluation method.
+                            performance_metric = model.evaluate_performance(val_data)
+                            logger.info(f"Performance of '{model_name}': {performance_metric}")
+                        except Exception as e:
+                            logger.error(f"Error evaluating performance of '{model_name}': {str(e)}")
+            except Exception as e:
+                logger.error(f"Performance monitoring error: {str(e)}")
+            await asyncio.sleep(self.monitoring_interval)
 
-    def _calculate_max_drawdown(self, equity):
-        peak = equity[0]
-        max_dd = 0
-        for value in equity:
-            if value > peak:
-                peak = value
-            dd = (peak - value) / peak
-            if dd > max_dd:
-                max_dd = dd
-        return max_dd * 100
+# In startup_event()
+retrain_system = RetrainRLSystem(app)
+app.retrain_rl_system = retrain_system  # Attach to app instance
+app.retrain_rl_system.market_data_store = app.market_data_store  # Grant access
+asyncio.create_task(retrain_system.continuous_retraining_scheduler())
+asyncio.create_task(retrain_system.monitor_performance())
 
 @app.on_event("shutdown")
 async def shutdown_event():
