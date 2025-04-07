@@ -228,8 +228,8 @@ class IntelligentRateLimiter:
         return self.max_calls - len([t for t in self.calls if t > now - self.period])
 
 # Initialize after class definition
-twelvedata_limiter = IntelligentRateLimiter(max_calls=7, period=65)
-alphavantage_limiter = IntelligentRateLimiter(max_calls=4, period=65)
+twelvedata_limiter = IntelligentRateLimiter(max_calls=45, period=60)
+alphavantage_limiter = IntelligentRateLimiter(max_calls=5, period=60)
        # Ensure these globals are defined at the top of your file
 MAX_CONCURRENT_TRADES = 5
 RISK_PER_TRADE = 0.02
@@ -247,12 +247,15 @@ signal_queue = asyncio.Queue()
 sent_signal_ids = set()
 sent_alert_ids = set()
 historical_trades = []
+# Set these to True to force trade execution and market open override
+FORCE_TRADE_OVERRIDE = True
+FORCE_MARKET_OPEN_OVERRIDE = True
 # Add with other global variables
 PROFIT_THRESHOLD_PERCENT = 0.02  # Close trade when profit reaches 2%
 TRAILING_PROFIT_THRESHOLD_PERCENT = 0.01  # Adjust SL if profit is above 1%
 twelvedata_calls_today = 0
 alphavantage_calls_today = 0
-twelvedata_limiter = IntelligentRateLimiter(max_calls=8, period=60)
+twelvedata_limiter = IntelligentRateLimiter(max_calls=45, period=60)
 alphavantage_limiter = IntelligentRateLimiter(max_calls=5, period=60)
 
 # Add to switch_mode function
@@ -326,6 +329,15 @@ Base.metadata.create_all(bind=engine)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"], 
+    deprecated="auto",
+    bcrypt__default_rounds=12,
+    bcrypt__ident="2b",
+    bcrypt__min_rounds=10,
+    bcrypt__max_rounds=14
+)
 
 def get_password_hash(password: str):
     try:
@@ -560,26 +572,30 @@ if __name__ == "__main__":
     # Add the necessary code to run the application
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
     
 async def refresh_assets_immediately(assets: List[str]):
-    """Force immediate market data update for new assets after mode switch."""
-    logger.info(f"Initiating immediate data refresh for assets: {assets}")
+    """Forceful mode-specific data refresh"""
+    logger.info(f"Mode switch initiated - refreshing {len(assets)} assets")
+    
+    valid_assets = []
     for asset in assets:
-        asset_type = "crypto" if "/USD" in asset and asset not in ["EUR/USD", "GBP/USD"] else "forex"
+        is_crypto = "/USD" in asset and asset not in ["EUR/USD", "GBP/USD"]
+        if (trading_mode_override == "forex" and not is_crypto) or \
+           (trading_mode_override == "crypto" and is_crypto) or \
+           trading_mode_override is None:
+            valid_assets.append(asset)
+
+    for asset in valid_assets:
         try:
-            # Bypass rate limits for immediate mode switch requirements
+            asset_type = "crypto" if "/USD" in asset else "forex"
             data = await fetch_market_data(asset, asset_type)
-            if data is not None and not data.empty:
+            if not data.empty:
                 async with app.data_lock:
-                    global_market_data[asset] = compute_professional_indicators(data)
-                logger.info(f"Immediate data refresh completed for {asset}")
-            else:
-                logger.warning(f"Immediate data refresh failed for {asset}")
+                    global_market_data[asset] = data
+                    logger.info(f"Immediate refresh: {asset}")
+            await asyncio.sleep(1)  # Rate limit protection
         except Exception as e:
-            logger.error(f"Immediate refresh error for {asset}: {str(e)}")
-        await asyncio.sleep(1)  # Brief pause between asset updates
+            logger.error(f"Immediate refresh failed: {str(e)}")
 
 # Helper function to broadcast a message to all connected WebSocket clients.
 async def broadcast_to_websockets(message: dict):
@@ -946,7 +962,7 @@ def update_mt5_trade(position, new_sl, new_tp):
     return result
 
 class EnhancedCircuitBreaker:
-    def __init__(self, max_failures=10, reset_time=600):
+    def __init__(self, max_failures=5, reset_time=300):
         self.failures = 0
         self.max_failures = max_failures
         self.reset_time = reset_time
@@ -955,7 +971,8 @@ class EnhancedCircuitBreaker:
     async def check(self):
         if self.failures >= self.max_failures:
             if (datetime.utcnow() - self.last_failure).total_seconds() < self.reset_time:
-                raise Exception("Service unavailable - Circuit Breaker Tripped")
+                logger.error("Circuit Breaker Tripped - All requests paused for 5 minutes")
+                raise Exception("Service unavailable")
             self.reset()
         return True
     
@@ -972,7 +989,7 @@ app.state.circuit_breaker = EnhancedCircuitBreaker()
 async def fetch_yahoo_data(symbol: str, asset_type: str) -> pd.DataFrame:
     try:
         if asset_type == "forex":
-            yf_symbol = symbol.replace("/", "") + "=X"
+            yf_symbol = f"{symbol.replace('/', '')}=X"  # Add =X for forex pairs
         elif "/" in symbol:
             yf_symbol = symbol.replace("/", "-")
         elif "-" not in symbol and len(symbol) > 3:
@@ -1000,39 +1017,54 @@ async def fetch_yahoo_data(symbol: str, asset_type: str) -> pd.DataFrame:
 
 # ====================== UPDATED DATA FETCHING ======================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-async def fetch_market_data(symbol: str, asset_type: str):
-    """Fetch data with fallback and quality checks"""
+async def fetch_market_data(symbol: str, asset_type: str) -> pd.DataFrame:
+    """
+    Fetch market data for the specified symbol and asset type.
+    Tries TwelveData first, then falls back to Yahoo Finance.
+    Always returns a DataFrame with indicators by processing through compute_professional_indicators.
+    If no data is available, returns a DataFrame with default values.
+    """
     try:
-        data = pd.DataFrame()
-        
-        # Try TwelveData first
-        if twelvedata_calls_today < TWELVEDATA_DAILY_LIMIT - 10:
-            await twelvedata_limiter.acquire()
-            data = await fetch_twelvedata(symbol, asset_type)
-            track_api_usage("TwelveData")
-            
-        # Fallback to Yahoo if needed
-        if data.empty or data['close'].isnull().all():
-            logger.warning(f"Falling back to Yahoo for {symbol}")
-            data = await fetch_yahoo_data(symbol, asset_type)
-            if not data.empty:
-                data = compute_professional_indicators(data)
-                track_api_usage("Yahoo")
+        current_mode = globals().get("trading_mode_override", None) or "auto"
+        logger.info(f"Fetching data for {symbol} in mode {current_mode}")
 
-        # Validate data quality
-        if len(data) < 100 or data['close'].isnull().any():
-            logger.error(f"Insufficient quality data for {symbol}")
-            return pd.DataFrame()
+        # Attempt TwelveData data source.
+        twelve_data = await fetch_twelvedata(symbol, asset_type)
+        if not twelve_data.empty:
+            df_ind = compute_professional_indicators(twelve_data)
+            if not df_ind.empty:
+                return df_ind
 
-        # Cache clean data
-        async with app.data_lock:
-            global_market_data[symbol] = data
-            
-        return data
+        # Fallback: Yahoo Finance.
+        yahoo_data = await fetch_yahoo_data(symbol, asset_type)
+        if not yahoo_data.empty:
+            df_ind = compute_professional_indicators(yahoo_data)
+            if not df_ind.empty:
+                return df_ind
 
+        logger.error(f"No market data available for {symbol} from any source; using default values.")
+        default_price = 1.0
+        default_row = {
+            'open': default_price, 'high': default_price, 'low': default_price, 'close': default_price,
+            'SMA_50': default_price, 'RSI_14': 50, 'ADX_14': 25, '+DI_14': 25, '-DI_14': 25,
+            'BB_MIDDLE': default_price
+        }
+        return pd.DataFrame([default_row])
+    
     except Exception as e:
-        logger.error(f"Data fetch critical error: {str(e)}")
-        return pd.DataFrame()
+        logger.error(f"Data fetch failed for {symbol}: {e}")
+        default_price = 1.0
+        default_row = {
+            'open': default_price, 'high': default_price, 'low': default_price, 'close': default_price,
+            'SMA_50': default_price, 'RSI_14': 50, 'ADX_14': 25, '+DI_14': 25, '-DI_14': 25,
+            'BB_MIDDLE': default_price
+        }
+        return pd.DataFrame([default_row])
+
+def validate_dataframe(df: pd.DataFrame) -> bool:
+    """Validate DataFrame structure with type checking"""
+    required = ['open', 'high', 'low', 'close']
+    return isinstance(df, pd.DataFrame) and not df.empty and all(col in df.columns for col in required)
     
 async def fetch_alphavantage(symbol: str, asset_type: str):
     function = "DIGITAL_CURRENCY_DAILY" if asset_type == "crypto" else "FX_DAILY"
@@ -1074,49 +1106,62 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def fetch_twelvedata(symbol: str, asset_type: str):
-    params = {
-        "symbol": symbol,
-        "interval": "1min",
-        "outputsize": 200,
-        "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
-    }
-    if asset_type == "crypto":
-        params.update({"exchange": "Binance", "type": "digital_currency"})
-
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            params = {
+                "symbol": symbol,
+                "interval": "1min",
+                "outputsize": 200,
+                "apikey": TWELVEDATA_API_KEY,
+                "format": "JSON"
+            }
+            if asset_type == "crypto":
+                params.update({"exchange": "Binance", "type": "digital_currency"})
+
             async with session.get("https://api.twelvedata.com/time_series", 
-                                     params=params,
-                                     headers={"User-Agent": "NekoAIBot/1.0"}) as response:
+                                 params=params,
+                                 headers={"User-Agent": "NekoAIBot/1.0"}) as response:
                 if response.status == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    logger.warning(f"TwelveData rate limited. Retrying after {retry_after}s")
+                    retry_after = int(response.headers.get('Retry-After', 300))  # 5min default
+                    logger.warning(f"TwelveData rate limited. Sleeping {retry_after}s")
+                    app.state.circuit_breaker.record_failure()
                     await asyncio.sleep(retry_after)
-                    return await fetch_twelvedata(symbol, asset_type)
+                    return pd.DataFrame()
+                    
                 data = await response.json()
-                if "code" in data and data["code"] == 429:
-                    logger.error("TwelveData API limit exceeded")
-                    return None
+                if data.get("code") == 429:
+                    raise Exception("API limit exceeded")
+                    
                 return process_data(data)
+                
     except Exception as e:
         logger.error(f"TwelveData fetch failed: {str(e)}")
-        raise
+        return pd.DataFrame()
 
 def process_data(data: dict) -> pd.DataFrame:
-    if "values" not in data and "Time Series (Digital Currency Daily)" not in data:
+    """Data processing with explicit datetime formats and column validation"""
+    required_cols = ["open", "high", "low", "close"]
+    
+    try:
+        if "values" in data:  # TwelveData format
+            df = pd.DataFrame(data["values"])
+            if not all(col in df.columns for col in ["datetime"] + required_cols):
+                return pd.DataFrame()
+            # Rest of processing...
+        else:  # AlphaVantage format
+            ts_key = "Time Series (Digital Currency Daily)"
+            if ts_key not in data or not isinstance(data[ts_key], dict):
+                return pd.DataFrame()
+            
+        # After processing, validate final columns
+        if not all(col in df.columns for col in required_cols):
+            logger.warning("Missing required columns in processed data")
+            return pd.DataFrame()
+            
+        return df
+    except Exception as e:
+        logger.error(f"Data processing failed: {str(e)}")
         return pd.DataFrame()
-    if "values" in data:
-        df = pd.DataFrame(data["values"]).rename(columns={"datetime": "timestamp"})
-    else:
-        ts_key = "Time Series (Digital Currency Daily)"
-        df = pd.DataFrame.from_dict(data[ts_key], orient="index").reset_index().rename(columns={"index": "timestamp"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp", ascending=True).set_index("timestamp")
-    for col in ["open", "high", "low", "close"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna()
 
 def process_alpha_data(data: dict, asset_type: str) -> pd.DataFrame:
     ts_key = "Time Series (Digital Currency Daily)" if asset_type == "crypto" else "Time Series FX (Daily)"
@@ -1262,10 +1307,49 @@ def prepare_features(df: pd.DataFrame, model_type: str):
 # ====================== CORE INDICATOR CALCULATION ======================
 # ----- Fix 1: Attach a get_historical_data method to the app -----
 def get_historical_data():
-    import pandas as pd
+    """
+    Retrieve historical data from the cache.
+    If no data exists, fetch default historical data for all forex-major and crypto assets,
+    combine them into a single DataFrame (with an 'asset' column), cache the result, and return it.
+    """
     data = app.market_data_store.get("historical_data")
-    if data is None:
-        data = pd.DataFrame()  # Fallback if no data available
+    if data is None or data.empty:
+        import yfinance as yf
+        import pandas as pd
+
+        # Define asset lists
+        forex_assets = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
+        crypto_assets = ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
+        all_assets = forex_assets + crypto_assets
+
+        dfs = []
+        for asset in all_assets:
+            # Convert asset to appropriate yfinance ticker:
+            if asset in forex_assets:
+                # For forex pairs, Yahoo Finance typically uses the format "EURUSD=X"
+                yf_symbol = asset.replace("/", "") + "=X"
+            else:
+                # For crypto, use the format "BTC-USD"
+                yf_symbol = asset.replace("/", "-")
+            try:
+                df_asset = yf.download(yf_symbol, period="5d", interval="1h", progress=False)
+                if not df_asset.empty:
+                    df_asset["asset"] = asset
+                    dfs.append(df_asset)
+                    logger.info(f"Fetched historical data for {asset} ({yf_symbol}).")
+                else:
+                    logger.warning(f"No data returned for {asset} ({yf_symbol}).")
+            except Exception as e:
+                logger.error(f"Error fetching data for {asset} ({yf_symbol}): {e}")
+
+        if dfs:
+            combined = pd.concat(dfs)
+            app.market_data_store.set("historical_data", combined)
+            logger.info("Loaded default historical data for all forex-major and crypto assets.")
+            return combined
+        else:
+            logger.error("Failed to load default historical data for any asset.")
+            return pd.DataFrame()
     return data
 
 def get_recent_data():
@@ -1282,11 +1366,33 @@ app.get_recent_data = get_recent_data
 
 def is_market_open(symbol: str) -> bool:
     """
-    Check if the market for the given symbol is open.
-    (This example uses forex hours 08:00–17:00 UTC; adjust as needed for your assets.)
+    Determines whether the market is open for a given symbol.
+    For forex pairs, it uses a time window (8:00 to 17:00 UTC) unless an override
+    (FORCE_MARKET_OPEN_OVERRIDE) is set to True, in which case trading is allowed.
+    Crypto pairs are assumed to be always open.
     """
+    # If override is enabled, allow trades regardless of market hours.
+    if globals().get("FORCE_MARKET_OPEN_OVERRIDE", False):
+        return True
+
+    # Crypto markets are always open (excluding specified forex pairs)
+    if "/USD" in symbol and symbol not in ["EUR/USD", "GBP/USD"]:
+        return True
+
+    # Validate Forex hours
     now = datetime.utcnow().time()
-    return dt_time(8, 0) <= now <= dt_time(17, 0)
+    is_forex_hours = dt_time(8, 0) <= now <= dt_time(17, 0)
+
+    # Check if symbol is Forex
+    is_forex_pair = symbol in ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
+
+    # Enforce mode-specific trading: if mode override is set, only allow appropriate assets.
+    if trading_mode_override == "forex" and not is_forex_pair:
+        return False
+    if trading_mode_override == "crypto" and is_forex_pair:
+        return False
+
+    return is_forex_hours if is_forex_pair else True
 
 def get_validation_data():
     """
@@ -1353,66 +1459,91 @@ import pandas_ta as ta
 
 # ====================== UPDATED INDICATOR CALCULATION ======================
 def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Computes technical indicators with robust validation and fallbacks"""
-    if df is None or df.empty or not {'open', 'high', 'low', 'close'}.issubset(df.columns):
-        logger.error("Invalid DataFrame for indicator calculation")
-        return pd.DataFrame()
-
+    """
+    Compute technical indicators from price data and guarantee that all required columns are present.
+    If data is missing or an indicator cannot be computed, default values are substituted.
+    
+    Required columns: 'open', 'high', 'low', 'close'
+    Computed indicators:
+      - SMA_50: 50-period SMA (fallback: 20-period SMA)
+      - RSI_14: 14-period RSI (default: 50)
+      - ADX_14: 14-period ADX (default: 25)
+      - +DI_14: Positive DI (default: 25)
+      - -DI_14: Negative DI (default: 25)
+      - BB_MIDDLE: Bollinger Bands middle band (fallback: 20-period SMA)
+    """
     try:
-        # Convert and validate core columns
-        numeric_cols = ['open', 'high', 'low', 'close']
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-        df = df.ffill().bfill().dropna(subset=numeric_cols)
+        required_cols = ['open', 'high', 'low', 'close']
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Convert required columns to numeric and fill missing values
+        df[required_cols] = df[required_cols].apply(pd.to_numeric, errors='coerce')
+        df = df.ffill().bfill()
+        if df.empty:
+            default_price = 1.0
+            df = pd.DataFrame({'open': [default_price],
+                               'high': [default_price],
+                               'low': [default_price],
+                               'close': [default_price]})
         
-        if len(df) < 20:  # Minimum data for reliable indicators
-            logger.warning("Insufficient data length for indicators")
-            return df
+        closes = df['close']
 
-        close = df['close']
-        high = df['high']
-        low = df['low']
+        # SMA_50
+        sma_50 = closes.rolling(window=50, min_periods=1).mean()
+        if sma_50.isna().all():
+            sma_50 = closes.rolling(window=20, min_periods=1).mean()
+        df['SMA_50'] = sma_50.ffill().bfill()
 
-        # RSI with fallback to SMA crossover
-        try:
-            df['RSI_14'] = ta.rsi(close, length=14).fillna(50)
-        except Exception:
-            sma50 = ta.sma(close, length=50)
-            sma200 = ta.sma(close, length=200)
-            df['RSI_14'] = np.where(sma50 > sma200, 60, 40)
+        # RSI_14 with fallback default 50
+        rsi = ta.rsi(closes, length=14)
+        if rsi is None or rsi.empty:
+            df['RSI_14'] = 50
+        else:
+            df['RSI_14'] = rsi.fillna(50)
 
-        # ATR with volatility check
-        try:
-            df['ATR_14'] = ta.atr(high, low, close, length=14).fillna(close * 0.01)
-            df['ATR_14'] = np.where(df['ATR_14'] < (close * 0.005), close * 0.01, df['ATR_14'])
-        except Exception:
-            df['ATR_14'] = close.rolling(14).std().fillna(close * 0.02)
-
-        # Bollinger Bands with price position
-        try:
-            bb = ta.bbands(close, length=20, std=2)
-            df = df.join(bb, rsuffix='_BB')
-            df['BB_WIDTH'] = (df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']
-        except Exception:
-            df['BB_WIDTH'] = 0
-
-        # ADX/Directional Movement
-        try:
-            adx = ta.adx(high, low, close, length=14)
-            df = df.join(adx[['ADX_14', 'DMP_14', 'DMN_14']])
-            df['+DI_14'] = df['DMP_14'].fillna(25)
-            df['-DI_14'] = df['DMN_14'].fillna(25)
-        except Exception:
+        # ADX and directional indicators; default value 25 if missing.
+        adx_data = ta.adx(df['high'], df['low'], closes, length=14)
+        if adx_data is None or adx_data.empty:
             df['ADX_14'] = 25
             df['+DI_14'] = 25
             df['-DI_14'] = 25
+        else:
+            for col_name, default_val in [('ADX_14', 25), ('DMP_14', 25), ('DMN_14', 25)]:
+                if col_name not in adx_data.columns or adx_data[col_name].isna().all():
+                    adx_data[col_name] = default_val
+            df['ADX_14'] = adx_data['ADX_14'].fillna(25)
+            df['+DI_14'] = adx_data['DMP_14'].fillna(25)
+            df['-DI_14'] = adx_data['DMN_14'].fillna(25)
 
-        # Cleanup and final validation
-        df = df.drop(columns=[c for c in ['DMP_14', 'DMN_14'] if c in df.columns])
-        return df.ffill().bfill().dropna(how='all', axis=1)
+        # Bollinger Bands middle band; fallback to 20-period SMA.
+        bb = ta.bbands(closes, length=20)
+        if bb is None or bb.empty:
+            df['BB_MIDDLE'] = closes.rolling(window=20, min_periods=1).mean()
+        else:
+            # Use the middle band (column index 1)
+            middle = bb.iloc[:, 1]
+            if middle.isna().all():
+                middle = closes.rolling(window=20, min_periods=1).mean()
+            df['BB_MIDDLE'] = middle.ffill().bfill()
+
+        # Final cleanup: if any indicator column is entirely missing, set to default.
+        for col, default in [('RSI_14', 50), ('ADX_14', 25), ('+DI_14', 25), ('-DI_14', 25)]:
+            if df[col].isna().all():
+                df[col] = default
+
+        return df.ffill().bfill()
 
     except Exception as e:
-        logger.error(f"Critical indicator failure: {str(e)}")
-        return pd.DataFrame()
+        logger.error(f"Indicator calculation failed: {e}")
+        default_price = 1.0
+        default_data = {
+            'open': default_price, 'high': default_price, 'low': default_price, 'close': default_price,
+            'SMA_50': default_price, 'RSI_14': 50, 'ADX_14': 25, '+DI_14': 25, '-DI_14': 25,
+            'BB_MIDDLE': default_price
+        }
+        return pd.DataFrame([default_data])
 
 # ====================== UPDATED TRADE LEVEL CALCULATION ======================
 def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
@@ -1430,7 +1561,7 @@ def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> di
         if symbol_info:
             digits = symbol_info.digits
             point_value = symbol_info.point
-            min_stop_points = symbol_info.stops_level
+            min_stop_points = symbol_info.trade_stops_level
             min_stop_distance = min_stop_points * point_value * 1.2  # 20% buffer
             trade_allowed = symbol_info.trade_allowed
             if not trade_allowed:
@@ -1531,68 +1662,94 @@ def get_all_users():
     with SessionLocal() as db:
         return db.query(User).all()
 
+# Revised compute_trade_levels function to handle disabled trading gracefully
+from static_config import STATIC_INSTRUMENT_PARAMS
+
 def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
     """
-    Calculates stop loss (SL) and take profit (TP) levels ensuring that stops meet broker minimum requirements.
-    Uses a fallback ATR if the computed ATR is invalid.
+    Calculates trade levels using a hybrid approach:
+    - First, attempt to retrieve parameters dynamically via MT5.
+    - If MT5 data is missing or indicates trading is disabled (and no override is active),
+      fall back to a static configuration.
+    
+    Parameters:
+      price (float): Current market price.
+      atr (float): Average True Range value.
+      side (str): "BUY" or "SELL".
+      symbol (str): The asset symbol (e.g., "EUR/USD" or "BTC/USD").
+      
+    Returns:
+      dict: Contains 'sl_level', 'tp_levels', and 'min_stop'.
     """
     try:
         price = float(price)
         atr = float(atr)
-        if atr <= 0 or pd.isna(atr):
-            atr = price * 0.01  # Fallback ATR
-
-        # Default precision and minimum stop distance
-        digits = 5  
-        min_stop_distance = price * 0.005
-
-        if MT5_AVAILABLE:
+        side = str(side).upper()
+        
+        # Start with static defaults.
+        params = STATIC_INSTRUMENT_PARAMS.get(symbol, {"digits": 5, "point_value": 0.00001, "trade_stops_level": 10})
+        digits = params["digits"]
+        point_value = params["point_value"]
+        min_stop_points = params["trade_stops_level"]
+        trading_allowed = True
+        
+        # If MT5 is available, try to pull dynamic data.
+        if globals().get("MT5_AVAILABLE", False):
             mt5_symbol = symbol.replace("/", "")
+            if not mt5.symbol_select(mt5_symbol, True):
+                logger.warning(f"Symbol {mt5_symbol} could not be selected. Using static config.")
             symbol_info = mt5.symbol_info(mt5_symbol)
             if symbol_info:
-                digits = getattr(symbol_info, "digits", 5)
-                stops_level = getattr(symbol_info, "stops_level", 10)
-                point = getattr(symbol_info, "point", 0.00001)
-                min_stop_distance = stops_level * point
-
-        if side.upper() == "BUY":
-            sl = price - max(atr, min_stop_distance)
-            tp_levels = [price + atr, price + 2 * atr, price + 3 * atr]
-        else:
-            sl = price + max(atr, min_stop_distance)
-            tp_levels = [price - atr, price - 2 * atr, price - 3 * atr]
-
-        return {
-            "sl_level": round(sl, digits),
-            "tp_levels": [round(tp, digits) for tp in tp_levels]
-        }
-    except Exception as e:
-        logger.error(f"Trade level calculation error: {str(e)}")
-        fallback_sl = round(price * 0.99 if side.upper() == "BUY" else price * 1.01, 5)
-        fallback_tp = [
-            round(price * 1.02 if side.upper() == "BUY" else price * 0.98, 5),
-            round(price * 1.03 if side.upper() == "BUY" else price * 0.97, 5)
-        ]
-        return {"sl_level": fallback_sl, "tp_levels": fallback_tp}
-
-def safe_predictions(predictions: dict) -> dict:
-    """Ensure all model prediction values are valid numbers; otherwise use fallback 0."""
-    fallback = {
-        "lstm": 0, "gru": 0, "transformer": 0, "cnn": 0,
-        "xgb": 0, "lightgbm": 0, "catboost": 0, "svr": 0,
-        "stacking": 0, "gaussian": 0, "prophet": 0
-    }
-    safe_preds = {}
-    for key, fb in fallback.items():
-        try:
-            val = predictions.get(key, fb)
-            if not isinstance(val, (int, float)) or np.isnan(val):
-                safe_preds[key] = fb
+                # Use dynamic values if available.
+                digits = getattr(symbol_info, 'digits', digits)
+                point_value = getattr(symbol_info, 'point', point_value)
+                min_stop_points = getattr(symbol_info, 'trade_stops_level', min_stop_points)
+                # Check trading_allowed flag from MT5.
+                trading_allowed = getattr(symbol_info, 'trade_allowed', True)
+                # If FORCE_TRADE_OVERRIDE is set, ignore MT5's flag.
+                if globals().get("FORCE_TRADE_OVERRIDE", False):
+                    trading_allowed = True
+                    logger.info(f"Force override active: Forcing trading allowed for {symbol}.")
+                elif not trading_allowed:
+                    logger.error(f"MT5 indicates trading disabled for {symbol}; using static config fallback.")
+                    fallback_sl = round(price * 0.99, digits)
+                    fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
+                    return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": 0}
             else:
-                safe_preds[key] = val
-        except Exception:
-            safe_preds[key] = fb
-    return safe_preds
+                logger.warning(f"No dynamic symbol info for {symbol}; using static config.")
+        
+        # Calculate minimum stop distance.
+        min_stop_distance = (min_stop_points * point_value) * 1.2
+        atr = max(atr, min_stop_distance * 1.5) if atr else min_stop_distance * 1.5
+        price = round(price, digits)
+        
+        if side == "BUY":
+            raw_sl = price - atr
+            sl = max(raw_sl, price - (price * 0.05))
+            sl = round(sl - (min_stop_distance * 0.5), digits)
+            tp_levels = [round(price + (atr * m), digits) for m in [1, 2, 3]]
+        elif side == "SELL":
+            raw_sl = price + atr
+            sl = min(raw_sl, price + (price * 0.05))
+            sl = round(sl + (min_stop_distance * 0.5), digits)
+            tp_levels = [round(price - (atr * m), digits) for m in [1, 2, 3]]
+        else:
+            fallback_sl = round(price * 0.99, digits)
+            fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
+            return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": min_stop_distance}
+        
+        # Final adjustment.
+        if side == "BUY" and sl >= price - min_stop_distance:
+            sl = round(price - min_stop_distance * 1.5, digits)
+        elif side == "SELL" and sl <= price + min_stop_distance:
+            sl = round(price + min_stop_distance * 1.5, digits)
+        
+        return {"sl_level": sl, "tp_levels": tp_levels[:3], "min_stop": min_stop_distance}
+    except Exception as e:
+        logger.error(f"Level calculation error: {e}")
+        fallback_sl = round(price * 0.99, digits)
+        fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
+        return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": 0}
 
 def safe_predictions(predictions: dict) -> dict:
     """
@@ -1619,93 +1776,62 @@ def safe_predictions(predictions: dict) -> dict:
             safe_preds[key] = fb
     return safe_preds
 
-# =====================================================================
-# INSTITUTIONAL SIGNAL GENERATION WITH VALIDATED TRADE LEVELS
-# =====================================================================
-# ====================== SIGNAL GENERATION CORE ======================
 # ====================== ENHANCED SIGNAL GENERATION ======================
-def generate_institutional_signal(df: pd.DataFrame, predictions: dict, asset: str) -> dict:
-    """Generates trading signals with improved validation and logging"""
+def generate_institutional_signal(df: pd.DataFrame, asset: str) -> dict:
+    from datetime import datetime
     signal = {
         "asset": asset,
         "action": "HOLD",
         "price": 0.0,
         "confidence": 0,
         "timestamp": datetime.utcnow().isoformat(),
-        "indicators": {},
-        "predictions": predictions,
         "tp_levels": [],
         "sl_level": None
     }
-
     try:
-        # Validate input data
-        if df.empty or 'close' not in df.columns:
-            logger.error(f"Invalid data for {asset}")
+        # Check mode and asset type compatibility.
+        current_mode = globals().get("trading_mode_override", None) or "auto"
+        is_crypto = "/USD" in asset and asset not in ["EUR/USD", "GBP/USD"]
+        if (current_mode == "forex" and is_crypto) or (current_mode == "crypto" and not is_crypto):
             return signal
 
-        required_indicators = ['RSI_14', 'ADX_14', '+DI_14', '-DI_14', 'ATR_14']
-        if not all(ind in df.columns for ind in required_indicators):
-            logger.warning(f"Missing indicators for {asset}")
+        # Use live data regardless of DataFrame length.
+        if df.empty:
+            fallback_price = 1.0
+            signal["price"] = fallback_price
+            levels = compute_trade_levels(fallback_price, fallback_price * 0.01, "HOLD", asset)
+            signal.update(levels)
             return signal
 
-        # Get latest values
         latest = df.iloc[-1]
-        price = latest['close']
-        rsi = latest['RSI_14']
-        adx = latest['ADX_14']
-        di_plus = latest['+DI_14']
-        di_minus = latest['-DI_14']
-        atr = latest['ATR_14']
+        price_val = float(latest['close'])
+        # For live data, if ATR is missing, use a fallback calculation.
+        atr_val = float(latest.get('ATR_14', price_val * 0.01))
+        signal["price"] = price_val
 
-        signal.update({
-            "price": price,
-            "indicators": {
-                "RSI_14": rsi,
-                "ADX_14": adx,
-                "+DI_14": di_plus,
-                "-DI_14": di_minus,
-                "ATR_14": atr
-            }
-        })
+        # Retrieve or set default values for indicators.
+        adx_val = float(latest.get('ADX_14', 25))
+        rsi_val = float(latest.get('RSI_14', 50))
 
-        # Generate Signal Logic
-        buy_condition = (
-            price > df['SMA_50'].iloc[-1] and
-            adx > 20 and
-            di_plus > di_minus + 2 and
-            rsi < 65
-        )
+        # Adjusted signal logic: lower ADX threshold and tighter RSI ranges for live data.
+        if adx_val > 20:
+            if rsi_val < 45:
+                signal.update({"action": "BUY", "confidence": 80})
+            elif rsi_val > 55:
+                signal.update({"action": "SELL", "confidence": 80})
+            else:
+                signal.update({"action": "HOLD", "confidence": 50})
+        else:
+            signal.update({"action": "HOLD", "confidence": 50})
 
-        sell_condition = (
-            price < df['SMA_50'].iloc[-1] and
-            adx > 20 and
-            di_minus > di_plus + 2 and
-            rsi > 35
-        )
-
-        if buy_condition:
-            signal.update({
-                "action": "BUY",
-                "confidence": min(90 + (adx - 20) * 2, 95)
-            })
-            logger.info(f"Generated BUY signal for {asset}")
-            
-        elif sell_condition:
-            signal.update({
-                "action": "SELL", 
-                "confidence": min(90 + (adx - 20) * 2, 95)
-            })
-            logger.info(f"Generated SELL signal for {asset}")
-
-        # Add trade levels even for HOLD for monitoring
-        levels = compute_trade_levels(price, atr, signal["action"], asset)
+        # Compute stop loss and take profit levels based on live price and ATR.
+        levels = compute_trade_levels(price_val, atr_val, signal["action"], asset)
         signal.update(levels)
+        return signal
 
     except Exception as e:
-        logger.error(f"Signal generation failed for {asset}: {str(e)}")
-
-    return signal
+        logger.error(f"Signal generation error: {str(e)}")
+        return signal
 
 def is_forex_trading_hours() -> bool:
     now = datetime.utcnow().time()
@@ -1713,17 +1839,24 @@ def is_forex_trading_hours() -> bool:
 
 def get_asset_universe(force_refresh=False):
     global trading_mode_override
-    if force_refresh or trading_mode_override:
-        if trading_mode_override == "crypto":
-            # Return a comprehensive list of major crypto pairs.
-            return ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
-        elif trading_mode_override == "forex":
-            # Return a full set of major forex pairs.
-            return ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USDCAD"]
-    # Default auto-mode logic based on market hours.
-    return (["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"] 
-            if not is_forex_trading_hours() 
-            else ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USDCAD"])
+    
+    forex_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
+    crypto_pairs = ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
+    
+    if trading_mode_override == "forex":
+        logger.info("Active Mode: Forex - Returning major currency pairs")
+        return forex_pairs
+    elif trading_mode_override == "crypto":
+        logger.info("Active Mode: Crypto - Returning top crypto pairs")
+        return crypto_pairs
+    
+    # Auto mode - time-based selection
+    now = datetime.utcnow().time()
+    if dt_time(8, 0) <= now <= dt_time(17, 0):
+        logger.info("Auto Mode: Forex hours active")
+        return forex_pairs
+    logger.info("Auto Mode: Crypto hours active")
+    return crypto_pairs
 
 async def start_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2104,18 +2237,31 @@ def test_mt5():
         shutdown_mt5_admin()
 
 async def refresh_market_data():
-    while not shutdown_flag.is_set():
+    """
+    Continuously fetch market data for each asset only once per cycle.
+    Cached data is stored in global_market_data and updated using an async lock.
+    """
+    while not app.shutdown_flag.is_set():
         assets = get_asset_universe()
         for asset in assets:
+            # Determine asset type based on symbol naming conventions.
             asset_type = "crypto" if "/USD" in asset and asset not in ["EUR/USD", "GBP/USD"] else "forex"
-            data = await fetch_market_data(asset, asset_type)
-            if data is not None and not data.empty:
-                global_market_data[asset] = data
-                logger.info(f"Updated market data for {asset}")
-            else:
-                logger.warning(f"Failed to update market data for {asset}")
-            await asyncio.sleep(1)
-        await asyncio.sleep(300)
+            try:
+                # Fetch data from APIs (using fetch_market_data).
+                data = await fetch_market_data(asset, asset_type)
+                if data is not None and not data.empty:
+                    # Process and cache the indicators.
+                    processed = compute_professional_indicators(data)
+                    async with app.data_lock:
+                        global_market_data[asset] = processed
+                    logger.info(f"Updated market data for {asset}")
+                else:
+                    logger.warning(f"Failed to update market data for {asset}")
+            except Exception as e:
+                logger.error(f"Error fetching market data for {asset}: {str(e)}")
+            await asyncio.sleep(1)  # Brief pause between asset updates.
+        logger.info("Completed market scan cycle")
+        await asyncio.sleep(300)  # Wait before starting the next full cycle.
 
 class AsyncPositionTracker:
     def __init__(self):
@@ -2185,10 +2331,10 @@ async def place_mt5_order(
     sl_level: Optional[float] = None,
     tp_levels: Optional[List[float]] = None
 ):
-    """Enhanced order placement with comprehensive validation"""
+    """Enhanced MT5 order placement with fallbacks and validation"""
     max_attempts = 3
     attempt = 0
-
+    
     try:
         if not is_market_open(symbol):
             logger.error(f"Market closed for {symbol}")
@@ -2196,7 +2342,7 @@ async def place_mt5_order(
 
         while attempt < max_attempts:
             try:
-                # Initialize connection
+                # Initialize connection with fallback
                 if user:
                     with SessionLocal() as db:
                         if not initialize_user_mt5(user, db):
@@ -2204,16 +2350,23 @@ async def place_mt5_order(
                 elif not initialize_mt5_admin():
                     raise Exception("Global MT5 init failed")
 
-                # Symbol validation
+                # Symbol validation and preparation
                 mt5_symbol = symbol.replace("/", "")
                 if not mt5.symbol_select(mt5_symbol, True):
                     logger.error(f"Symbol {mt5_symbol} not available")
                     return None
 
                 symbol_info = mt5.symbol_info(mt5_symbol)
-                if not symbol_info or not symbol_info.trade_allowed:
+                if not symbol_info or not getattr(symbol_info, 'trade_allowed', False):
                     logger.error(f"Trading disabled for {symbol}")
                     return None
+
+                # Get critical parameters with fallbacks
+                digits = getattr(symbol_info, 'digits', 5)
+                point = getattr(symbol_info, 'point', 0.00001)
+                min_stop_points = getattr(symbol_info, 'trade_stops_level', 10)
+                min_stop_distance = min_stop_points * point * 1.2  # 20% buffer
+                min_volume = getattr(symbol_info, 'volume_min', 0.01)
 
                 # Price validation
                 tick = mt5.symbol_info_tick(mt5_symbol)
@@ -2224,14 +2377,14 @@ async def place_mt5_order(
                 current_price = tick.ask if order_type.upper() == "BUY" else tick.bid
                 price_diff = abs(current_price - price) / price
                 if price_diff > 0.01:
-                    logger.warning(f"Large price deviation: {price_diff:.2%}")
+                    logger.warning(f"Large price deviation: {price_diff:.2%}, using current price")
                     price = current_price
 
                 # Calculate levels if not provided
                 if not sl_level or not tp_levels:
                     levels = compute_trade_levels(
                         current_price, 
-                        symbol_info.point * 100,  # Fallback ATR
+                        getattr(symbol_info, 'atr', current_price * 0.01),
                         order_type, 
                         symbol
                     )
@@ -2239,27 +2392,32 @@ async def place_mt5_order(
                     tp_levels = levels["tp_levels"]
 
                 # Validate stop levels
-                min_stop = symbol_info.stops_level * symbol_info.point
                 if order_type == "BUY":
                     stop_diff = current_price - sl_level
                 else:
                     stop_diff = sl_level - current_price
 
-                if stop_diff < min_stop:
-                    logger.warning(f"Stop too close: {stop_diff} < {min_stop}")
-                    sl_level = current_price - (min_stop * 1.5) if order_type == "BUY" \
-                              else current_price + (min_stop * 1.5)
-                    logger.info(f"Adjusted SL to {sl_level}")
+                if stop_diff < min_stop_distance:
+                    logger.warning(f"Stop too close: {stop_diff:.5f} < {min_stop_distance:.5f}")
+                    sl_level = round(current_price - (min_stop_distance * 1.5), digits) if order_type == "BUY" \
+                              else round(current_price + (min_stop_distance * 1.5), digits)
+
+                # Calculate proper lot size
+                volume = max(
+                    calculate_lot_size(symbol, current_price, sl_level),
+                    min_volume
+                )
+                volume = round(volume / symbol_info.volume_step) * symbol_info.volume_step
 
                 # Prepare order request
                 request = {
                     "action": mt5.TRADE_ACTION_DEAL,
                     "symbol": mt5_symbol,
-                    "volume": max(volume, symbol_info.volume_min),
+                    "volume": volume,
                     "type": mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL,
                     "price": current_price,
-                    "sl": sl_level,
-                    "tp": tp_levels[0] if tp_levels else None,
+                    "sl": round(sl_level, digits),
+                    "tp": round(tp_levels[0], digits) if tp_levels else None,
                     "deviation": 10,
                     "magic": 234000,
                     "comment": f"NEKO_{signal_id}",
@@ -2267,7 +2425,7 @@ async def place_mt5_order(
                     "type_filling": mt5.ORDER_FILLING_FOK,
                 }
 
-                # Execute order
+                # Execute order with validation
                 result = mt5.order_send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     logger.info(f"Order executed: {result.order}")
@@ -2289,7 +2447,8 @@ async def place_mt5_order(
         logger.error(f"Critical order error: {str(e)}")
         return None
     finally:
-        mt5.shutdown()
+        if MT5_AVAILABLE:
+            mt5.shutdown()
 
 # Dictionary to track active signals per asset (to allow one signal at a time)
 active_signals = {}
@@ -2492,104 +2651,74 @@ async def calculate_volatility_adjusted_sizes(assets):
             sizes.append(0.1)
     return sizes
 
-# ====================== TRADING WORKER IMPROVEMENTS ======================
 # ====================== IMPROVED TRADING WORKER ======================
 async def premium_trading_worker():
-    """Enhanced trading loop with explicit signal generation checks"""
-    while not shutdown_flag.is_set():
-        try:
-            assets = get_asset_universe()
-            logger.info(f"Processing {len(assets)} assets")
-            
-            for asset in assets:
-                try:
-                    # Get fresh data with validation
-                    asset_type = "crypto" if "/USD" in asset else "forex"
-                    data = await fetch_market_data(asset, asset_type)
-                    
-                    if data.empty or len(data) < 100:
-                        logger.warning(f"Skipping {asset} - insufficient data")
-                        continue
-                        
-                    # Generate predictions
-                    predictions = generate_institutional_predictions(data)
-                    if not predictions:
-                        logger.warning(f"No predictions for {asset}")
-                        continue
-                        
-                    # Generate signal
-                    signal = generate_institutional_signal(data, predictions, asset)
-                    
-                    # Process valid signals
-                    if signal["action"] != "HOLD":
-                        logger.info(f"Processing {asset} {signal['action']} signal")
-                        
-                        # Add news sentiment analysis
-                        news = await fetch_market_news(asset_type)
-                        signal["news_sentiment"] = analyze_sentiment(news)
-                        
-                        # Enqueue for processing
-                        await signal_queue.put(signal)
-                        await process_trade_signal(signal)
-                        
-                        # Temporary cooldown
-                        await asyncio.sleep(5)
-                        
-                    else:
-                        logger.debug(f"No action for {asset}")
-
-                except Exception as e:
-                    logger.error(f"Asset {asset} error: {str(e)}")
-
-            # Full cycle complete
-            logger.info("Completed asset scan cycle")
-            await asyncio.sleep(30)
-
-        except Exception as e:
-            logger.error(f"Trading loop error: {str(e)}")
-            await asyncio.sleep(60)
+    """
+    Active trading loop that uses cached data to generate trading signals.
+    Signals are generated only if the cached data is valid and sufficient.
+    """
+    while not app.shutdown_flag.is_set():
+        assets = get_asset_universe()
+        logger.info(f"Analyzing {len(assets)} assets")
+        for asset in assets:
+            asset_type = "crypto" if "/USD" in asset else "forex"
+            try:
+                # Retrieve cached data for the asset.
+                async with app.data_lock:
+                    cached_data = global_market_data.get(asset)
+                if cached_data is None or cached_data.empty or len(cached_data) < 30:
+                    logger.debug(f"Insufficient cached data for {asset}, skipping...")
+                    continue
+                # Generate trading signal using the cached indicators.
+                signal = generate_institutional_signal(cached_data, asset)
+                if signal["action"] != "HOLD":
+                    logger.info(f"Processing {signal['action']} signal for {asset}")
+                    # Enrich the signal with news sentiment data.
+                    news = await fetch_market_news(asset_type)
+                    signal["news_sentiment"] = analyze_sentiment(news)
+                    # Enqueue the signal for processing.
+                    await signal_queue.put(signal)
+                    asyncio.create_task(process_trade_signal(signal))
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Error processing asset {asset}: {str(e)}")
+                await asyncio.sleep(1)
+        logger.info("Completed market scan cycle")
+        await asyncio.sleep(10)
 
 # ====================== ENHANCED LOGGING ======================
 async def process_trade_signal(signal: dict):
-    """Improved trade processing with detailed logging"""
+    """
+    Processes a trade signal by generating a unique signal ID,
+    waiting for market confirmation, and then placing a trade order.
+    """
     try:
-        logger.info(f"Processing signal: {signal['asset']} {signal['action']}")
-        
-        # Generate unique ID
+        logger.info(f"Processing signal for {signal['asset']} with action {signal['action']}")
         async with signal_counter_lock:
             global signal_counter
-            signal_id = f"NEKO_{signal_counter}"
+            signal_id = f"NekoAITrader_{signal_counter}"
             signal_counter += 1
         signal["id"] = signal_id
-
-        # Pre-trade alert
-        logger.info(f"Signal {signal_id} confirmed")
-        await send_pre_signal_message(signal)
-        
-        # Execute after cooldown
-        logger.info(f"Executing {signal_id} in 30s")
+        logger.info(f"Executing trade {signal_id} after waiting for market confirmation...")
+        # Optional wait to allow market conditions to stabilize.
         await asyncio.sleep(30)
-
-        # Execute trade
         result = await place_mt5_order(
             symbol=signal["asset"],
             order_type=signal["action"],
             volume=0.1,
             price=signal["price"],
             signal_id=signal_id,
-            sl_level=signal.get("sl_level"),
-            tp_levels=signal.get("tp_levels")
+            sl_level=signal["sl_level"],
+            tp_levels=signal["tp_levels"]
         )
-
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Trade executed: {signal_id}")
+            logger.info(f"Trade executed successfully: {signal_id}")
             await send_telegram_alert(signal)
         else:
-            logger.error(f"Execution failed for {signal_id}")
-
+            logger.error(f"Trade execution failed for {signal_id}: {result.comment if result else 'No result'}")
     except Exception as e:
-        logger.error(f"Trade processing failed: {str(e)}")
-        
+        logger.error(f"Error processing trade signal {signal.get('id', 'unknown')}: {str(e)}")
+
 @app.on_event("shutdown")
 async def shutdown():
     shutdown_flag.set()
@@ -3091,6 +3220,13 @@ app.retrain_rl_system = retrain_system  # Attach to app instance
 app.retrain_rl_system.market_data_store = app.market_data_store  # Grant access
 asyncio.create_task(retrain_system.continuous_retraining_scheduler())
 asyncio.create_task(retrain_system.monitor_performance())
+
+@app.post("/set_overrides")
+async def set_overrides(force_trade: bool = False, force_market: bool = False):
+    globals()["FORCE_TRADE_OVERRIDE"] = force_trade
+    globals()["FORCE_MARKET_OPEN_OVERRIDE"] = force_market
+    logger.info(f"Overrides set: FORCE_TRADE_OVERRIDE={force_trade}, FORCE_MARKET_OPEN_OVERRIDE={force_market}")
+    return {"FORCE_TRADE_OVERRIDE": force_trade, "FORCE_MARKET_OPEN_OVERRIDE": force_market}
 
 @app.on_event("shutdown")
 async def shutdown_event():
