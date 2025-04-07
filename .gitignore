@@ -9,7 +9,7 @@ env/
 ENV/
 gnn_env/
 std_env/
-
+backtest_env/
 # Distribution / packaging
 .Python
 build/

@@ -198,7 +198,6 @@ gluonts
 nbeats-keras
 spektral
 pywavelets
-compute-hurst
 stable-baselines3
 pandas-ta
 lightgbm
