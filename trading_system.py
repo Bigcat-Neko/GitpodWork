@@ -1,350 +1,539 @@
 # trading_system.py
 import os
-import sys
 import time
+import logging
 import joblib
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+import warnings
 
-# Fix telegram imports
-sys.modules['telegram'] = __import__('telegram')
-sys.modules['telegram.vendor.ptb_urllib3.urllib3'] = __import__('urllib3')
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
-
+from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
 from twelvedata import TDClient
 import pandas_ta as ta
 from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import TimeSeriesSplit
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
-from sklearn.svm import SVC
-from sklearn.gaussian_process import GaussianProcessClassifier
-from sklearn.ensemble import StackingClassifier
-from tensorflow.keras.models import Sequential, save_model
-from tensorflow.keras.layers import LSTM, GRU, Conv1D, Dense, Dropout, MultiHeadAttention, LayerNormalization, Input, GlobalMaxPooling1D
+
+# --- Classical ML and Other Libraries ---
+from xgboost import XGBRegressor
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+from sklearn.svm import SVC, SVR
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.ensemble import StackingRegressor
+from sklearn.ensemble import IsolationForest
+from prophet import Prophet
+
+# --- Deep Learning & Keras ---
+import tensorflow as tf
+from tensorflow.keras.models import Model, Sequential, save_model
+from tensorflow.keras.layers import Input, LSTM, GRU, Conv1D, Dense, Dropout, GlobalMaxPooling1D, MultiHeadAttention, LayerNormalization
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import Model
-from stable_baselines3 import DQN, PPO
-from stable_baselines3.common.env_checker import check_env
-import vectorbt as vbt
+
+# --- RL Libraries ---
 import gym
 from gym import spaces
+from stable_baselines3 import DQN, PPO
 
-# Initialize environment
+import vectorbt as vbt
+
+# Force TensorFlow CPU only.
+tf.config.set_visible_devices([], 'GPU')
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+tf.get_logger().setLevel('ERROR')
+logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 os.makedirs('models', exist_ok=True)
 
-# ========================
-# Configuration
-# ========================
-ASSETS = ['EUR/USD', 'GBP/USD', 'BTC/USD', 'ETH/USD']
-LOOKBACK = 60
-INDICATORS = [
-    'sma_10', 'sma_20', 'ema_10', 'ema_20', 'wma_20', 'hma_14', 
-    'macd', 'rsi', 'stoch', 'adx', 'cci', 'willr', 'uo', 'mom', 
-    'roc', 'atr', 'obv', 'cmf', 'vwap', 'bbands', 'kc', 'psar', 
-    'supertrend', 'ichimoku', 'stc', 'vwma', 'pvo', 'efi', 'vortex'
+##############################
+# Global Configuration
+##############################
+FOREX_PAIRS = [
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD',
+    'USD/CAD', 'NZD/USD', 'USD/SGD', 'USD/HKD', 'USD/TRY',
+    'USD/MXN', 'USD/ZAR', 'USD/SEK', 'USD/NOK', 'USD/DKK'
+]
+CRYPTO_PAIRS = [
+    'BTC/USD', 'ETH/USD', 'XRP/USD', 'LTC/USD', 'BCH/USD',
+    'ADA/USD', 'DOT/USD', 'LINK/USD', 'BNB/USD', 'XLM/USD',
+    'DOGE/USD', 'SOL/USD', 'MATIC/USD', 'AVAX/USD', 'ATOM/USD'
 ]
 
+MODEL_LIST = [
+    'LSTM', 'GRU', 'CNN', 'Transformer', 'XGBoost', 'LightGBM',
+    'CatBoost', 'Stacking', 'GaussianProcess', 'Prophet', 'Sentiment',
+    'Anomaly', 'SVR', 'DQN', 'PPO'
+]
+
+INDICATOR_CONFIG = [
+    {'kind': 'sma', 'length': 20}, {'kind': 'ema', 'length': 20},
+    {'kind': 'wma', 'length': 20}, {'kind': 'hma', 'length': 20},
+    {'kind': 'macd'}, {'kind': 'rsi'}, {'kind': 'stoch'},
+    {'kind': 'adx'}, {'kind': 'cci'}, {'kind': 'vwap'},
+    {'kind': 'atr'}, {'kind': 'bbands'}, {'kind': 'supertrend'},
+    {'kind': 'ichimoku'}, {'kind': 'obv'}, {'kind': 'vwma'},
+    {'kind': 'mom'}, {'kind': 'willr'}, {'kind': 'ppo'},
+    {'kind': 'roc'}, {'kind': 'psar'}, {'kind': 'kvo'},
+    {'kind': 'pvo'}, {'kind': 'efi'}, {'kind': 'vortex'}
+]
+
+# Hyperparameter configuration.
 MODEL_CONFIG = {
-    'LSTM': {'units': 256, 'dropout': 0.3, 'epochs': 50, 'batch_size': 64},
-    'GRU': {'units': 256, 'dropout': 0.3, 'epochs': 50, 'batch_size': 64},
-    'CNN': {'filters': 128, 'kernel_size': 3, 'epochs': 30, 'batch_size': 64},
-    'Transformer': {'heads': 4, 'key_dim': 32, 'epochs': 30, 'batch_size': 64},
-    'XGBoost': {'n_estimators': 500, 'learning_rate': 0.01},
-    'LightGBM': {'n_estimators': 500, 'learning_rate': 0.05},
-    'CatBoost': {'iterations': 500, 'learning_rate': 0.03},
-    'SVR': {'C': 1.0, 'kernel': 'rbf'},
-    'Gaussian': {'n_restarts_optimizer': 3},
-    'DQN': {'policy': 'MlpPolicy', 'learning_rate': 1e-4, 'total_timesteps': 10000},
-    'PPO': {'policy': 'MlpPolicy', 'learning_rate': 2.5e-4, 'total_timesteps': 10000}
+    'LSTM': {'units': 256, 'dropout': 0.3, 'epochs': 50, 'batch_size': 64, 'learning_rate': 0.001},
+    'GRU': {'units': 256, 'dropout': 0.3, 'epochs': 50, 'batch_size': 64, 'learning_rate': 0.001},
+    'CNN': {'filters': 128, 'kernel_size': 3, 'epochs': 30, 'batch_size': 64, 'learning_rate': 0.001},
+    'Transformer': {'heads': 4, 'key_dim': 32, 'epochs': 30, 'batch_size': 64, 'learning_rate': 0.001},
+    'XGBoost': {'n_estimators': 1000, 'learning_rate': 0.01},
+    'LightGBM': {'num_boost_round': 500, 'learning_rate': 0.05},
+    'CatBoost': {'iterations': 1000, 'learning_rate': 0.03, 'verbose': False},
+    'Stacking': {},
+    'GaussianProcess': {},
+    'Prophet': {},
+    'Sentiment': {'epochs': 30, 'batch_size': 64, 'learning_rate': 0.001},
+    'Anomaly': {'epochs': 30, 'batch_size': 64, 'learning_rate': 0.001},
+    'SVR': {'C': 1.0, 'epsilon': 0.1},
+    'DQN': {'total_timesteps': 10000},
+    'PPO': {'total_timesteps': 10000},
 }
 
-# ========================
-# Custom Trading Environment
-# ========================
-class TradingEnv(gym.Env):
-    def __init__(self, df):
-        super(TradingEnv, self).__init__()
-        self.df = df
-        self.current_step = 0
-        self.action_space = spaces.Discrete(3)  # 0: sell, 1: hold, 2: buy
-        self.observation_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(len(INDICATORS), ),
-            dtype=np.float32
-        )
+# For classical ML models using scikit-learn interfaces.
+CLASSICAL_MAP = {
+    'XGBoost': XGBRegressor,
+    'LightGBM': None,  # Will use lgb.train to create a Booster.
+    'CatBoost': CatBoostRegressor,
+    'Stacking': StackingRegressor,
+    'GaussianProcess': GaussianProcessRegressor,
+    'SVR': SVR,
+}
 
+# Save file mapping and methods.
+SAVE_CONFIG = {
+    'LSTM':    {'ext': '.keras',  'method': 'tf'},
+    'GRU':     {'ext': '.keras',  'method': 'tf'},
+    'CNN':     {'ext': '.keras',  'method': 'tf'},
+    'Transformer': {'ext': '.keras', 'method': 'tf'},
+    'XGBoost': {'ext': '.json',   'method': 'xgb'},
+    'LightGBM':{'ext': '.txt',    'method': 'lgb'},
+    'CatBoost':{'ext': '.cbm',    'method': 'catboost'},
+    'Stacking':{'ext': '.pkl',    'method': 'joblib'},
+    'GaussianProcess':{'ext': '.pkl', 'method': 'joblib'},
+    'Prophet': {'ext': '.pkl',    'method': 'joblib'},
+    'Sentiment':{'ext': '.keras',  'method': 'tf'},
+    'Anomaly': {'ext': '.keras',  'method': 'tf'},
+    'SVR':     {'ext': '.pkl',    'method': 'joblib'},
+    'DQN':     {'ext': '.zip',    'method': 'stable_baselines3'},
+    'PPO':     {'ext': '.zip',    'method': 'stable_baselines3'},
+}
+
+# For deep models expecting sequence input.
+WINDOW_SIZE = 10
+
+##############################
+# Custom Trading Environment for RL Models
+##############################
+class TradingEnv(gym.Env):
+    """
+    A simple trading environment for RL.
+    Observation: current normalized price and technical features.
+    Action: 0 (sell) or 1 (buy).
+    Reward: daily return * (2*action - 1).
+    """
+    metadata = {'render.modes': ['human']}
+    
+    def __init__(self, prices, features):
+        super(TradingEnv, self).__init__()
+        self.prices = prices.reset_index(drop=True)
+        self.features = features
+        self.current_step = 0
+        self.total_steps = len(prices) - 1
+        self.action_space = spaces.Discrete(2)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(features.shape[1] + 1,), dtype=np.float32)
+        
     def reset(self):
         self.current_step = 0
-        return self._get_obs()
-
+        return self._get_observation()
+    
+    def _get_observation(self):
+        # observation: concatenation of current price and features at current step.
+        price = self.prices.iloc[self.current_step]
+        feat = self.features[self.current_step]
+        return np.concatenate(([price], feat))
+    
     def step(self, action):
-        reward = self._calculate_reward(action)
+        done = False
+        # reward: if action==1 (buy) then reward = price increase, else negative of it.
+        current_price = self.prices.iloc[self.current_step]
+        next_price = self.prices.iloc[self.current_step + 1]
+        reward = (next_price - current_price) if action == 1 else (current_price - next_price)
         self.current_step += 1
-        done = self.current_step >= len(self.df) - 1
-        return self._get_obs(), reward, done, {}
+        if self.current_step >= self.total_steps:
+            done = True
+        obs = self._get_observation() if not done else np.zeros(self.observation_space.shape)
+        return obs, reward, done, {}
+    
+    def render(self, mode='human', close=False):
+        pass
 
-    def _get_obs(self):
-        return self.df.iloc[self.current_step][INDICATORS].values.astype(np.float32)
+##############################
+# Utility Functions
+##############################
+def create_sequences(X, y, window_size=WINDOW_SIZE):
+    seq_X, seq_y = [], []
+    y = np.array(y)
+    for i in range(len(X) - window_size + 1):
+        seq_X.append(X[i:i+window_size])
+        seq_y.append(y[i+window_size-1])
+    return np.array(seq_X), np.array(seq_y)
 
-    def _calculate_reward(self, action):
-        current_price = self.df.iloc[self.current_step]['close']
-        next_price = self.df.iloc[self.current_step + 1]['close']
-        price_change = (next_price - current_price) / current_price
-        
-        if action == 2:  # Buy
-            return price_change
-        elif action == 0:  # Sell
-            return -price_change
-        return 0  # Hold
-
-# ========================
-# Enhanced ModelForge Class
-# ========================
-class ModelForge:
-    @staticmethod
-    def create_model(model_type, input_shape):
-        try:
-            if model_type == 'LSTM':
-                model = Sequential([
-                    LSTM(MODEL_CONFIG['LSTM']['units'], input_shape=input_shape),
-                    Dropout(MODEL_CONFIG['LSTM']['dropout']),
-                    Dense(1, activation='sigmoid')
-                ])
-                model.compile(optimizer=Adam(0.001), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            elif model_type == 'GRU':
-                model = Sequential([
-                    GRU(MODEL_CONFIG['GRU']['units'], input_shape=input_shape),
-                    Dropout(MODEL_CONFIG['GRU']['dropout']),
-                    Dense(1, activation='sigmoid')
-                ])
-                model.compile(optimizer=Adam(0.001), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            elif model_type == 'CNN':
-                model = Sequential([
-                    Conv1D(MODEL_CONFIG['CNN']['filters'], MODEL_CONFIG['CNN']['kernel_size'], 
-                          activation='relu', input_shape=input_shape),
-                    GlobalMaxPooling1D(),
-                    Dense(1, activation='sigmoid')
-                ])
-                model.compile(optimizer=Adam(0.001), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            elif model_type == 'Transformer':
-                inputs = Input(shape=input_shape)
-                x = MultiHeadAttention(num_heads=MODEL_CONFIG['Transformer']['heads'], 
-                                     key_dim=MODEL_CONFIG['Transformer']['key_dim'])(inputs, inputs)
-                x = LayerNormalization(epsilon=1e-6)(x)
-                x = Dense(64, activation='relu')(x)
-                outputs = Dense(1, activation='sigmoid')(x)
-                model = Model(inputs=inputs, outputs=outputs)
-                model.compile(optimizer=Adam(0.001), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            elif model_type == 'XGBoost':
-                model = XGBClassifier(**MODEL_CONFIG['XGBoost'])
-            
-            elif model_type == 'LightGBM':
-                model = LGBMClassifier(**MODEL_CONFIG['LightGBM'])
-            
-            elif model_type == 'CatBoost':
-                model = CatBoostClassifier(**MODEL_CONFIG['CatBoost'], silent=True)
-            
-            elif model_type == 'SVR':
-                model = SVC(**MODEL_CONFIG['SVR'], probability=True)
-            
-            elif model_type == 'Gaussian':
-                model = GaussianProcessClassifier(**MODEL_CONFIG['Gaussian'])
-            
-            elif model_type == 'DQN':
-                env = DummyVecEnv([lambda: TradingEnv(pd.DataFrame())])
-                model = DQN(MODEL_CONFIG['DQN']['policy'], env, 
-                           learning_rate=MODEL_CONFIG['DQN']['learning_rate'], verbose=0)
-            
-            elif model_type == 'PPO':
-                env = DummyVecEnv([lambda: TradingEnv(pd.DataFrame())])
-                model = PPO(MODEL_CONFIG['PPO']['policy'], env, 
-                           learning_rate=MODEL_CONFIG['PPO']['learning_rate'], verbose=0)
-            
-            return model
-        except Exception as e:
-            print(f"Model creation failed for {model_type}: {str(e)}")
-            return None
-
-# ========================
-# Data Engine
-# ========================
+##############################
+# Data Master
+##############################
 class DataMaster:
     def __init__(self):
         self.td = TDClient(apikey=os.getenv('TWELVEDATA_API_KEY'))
-        
-    def fetch_data(self, symbol):
-        for _ in range(3):  # Retry mechanism
-            try:
-                df = self.td.time_series(
-                    symbol=symbol,
-                    interval='1day',
-                    start_date='2020-01-01',
-                    outputsize=1000
-                ).as_pandas()
-                time.sleep(12)  # Rate limiting
-                return df
-            except Exception as e:
-                print(f"Error fetching {symbol}: {e}")
-                time.sleep(30)
-        return None
-    
-    def add_indicators(self, df):
-        try:
-            df = df.drop(columns=[c for c in df.columns if c != 'close'], errors='ignore')
-            
-            for indicator in INDICATORS:
-                if '_' in indicator:
-                    func, length = indicator.split('_')
-                    getattr(df.ta, func)(int(length), append=True)
-                else:
-                    getattr(df.ta, indicator)(append=True)
-            
-            return df.dropna()
-        except Exception as e:
-            print(f"Indicator error: {str(e)}")
-            return df
-
-# ========================
-# Backtesting System
-# ========================
-class BacktestPro:
-    def __init__(self):
         self.scaler = RobustScaler()
-        
-    def prepare_data(self, df):
-        try:
-            df['returns'] = df['close'].pct_change()
-            df = df.dropna()
-            features = self.scaler.fit_transform(df[INDICATORS])
-            target = (df['returns'].shift(-1) > 0).astype(int).values[:-1]
-            return features[:-1], target
-        except Exception as e:
-            print(f"Data preparation failed: {str(e)}")
-            return None, None
-    
-    def train_model(self, model, model_type, X_train, y_train):
-        try:
-            if model_type in ['LSTM', 'GRU', 'CNN', 'Transformer']:
-                X_reshaped = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
-                model.fit(X_reshaped, y_train, 
-                         epochs=MODEL_CONFIG[model_type]['epochs'],
-                         batch_size=MODEL_CONFIG[model_type]['batch_size'],
-                         verbose=0)
-            elif model_type in ['DQN', 'PPO']:
-                model.learn(total_timesteps=MODEL_CONFIG[model_type]['total_timesteps'])
-            else:
-                model.fit(X_train, y_train)
-        except Exception as e:
-            print(f"Training failed for {model_type}: {str(e)}")
-    
-    def backtest(self, model, model_type, X, y, prices):
-        try:
-            if model_type in ['LSTM', 'GRU', 'CNN', 'Transformer']:
-                X_reshaped = X.reshape(X.shape[0], 1, X.shape[1])
-                preds = model.predict(X_reshaped).flatten()
-            elif model_type in ['DQN', 'PPO']:
-                env = TradingEnv(pd.DataFrame({'close': prices}))
-                obs = env.reset()
-                preds = []
-                while True:
-                    action, _ = model.predict(obs)
-                    preds.append(action)
-                    obs, _, done, _ = env.step(action)
-                    if done: break
-                preds = np.array(preds)
-            else:
-                preds = model.predict_proba(X)[:, 1]
-            
-            entries = preds > 0.6 if model_type not in ['DQN', 'PPO'] else preds == 2
-            exits = preds < 0.4 if model_type not in ['DQN', 'PPO'] else preds == 0
-            
-            pf = vbt.Portfolio.from_signals(
-                prices,
-                entries,
-                exits,
-                fees=0.001,
-                slippage=0.005
-            )
-            return pf.sharpe_ratio()
-        except Exception as e:
-            print(f"Backtesting failed for {model_type}: {str(e)}")
-            return 0
-    
-    def save_model(self, model, model_type, asset):
-        try:
-            asset_clean = asset.replace('/', '_')
-            filename = f"models/{asset_clean}_{model_type}"
-            
-            if isinstance(model, Sequential):
-                save_model(model, f"{filename}.keras")
-            elif model_type == 'XGBoost':
-                model.save_model(f"{filename}.json")
-            elif model_type == 'LightGBM':
-                model.booster_.save_model(f"{filename}.txt")
-            elif model_type == 'CatBoost':
-                model.save_model(f"{filename}.cbm")
-            elif model_type in ['DQN', 'PPO']:
-                model.save(f"{filename}.zip")
-            else:
-                joblib.dump(model, f"{filename}.pkl")
-        except Exception as e:
-            print(f"Model save failed for {model_type}: {str(e)}")
+        self.last_fetch_time = 0
+        self.delay = 1.5
 
-# ========================
-# Main Execution
-# ========================
-if __name__ == "__main__":
-    dm = DataMaster()
-    bt = BacktestPro()
-    
-    for asset in ASSETS:
-        print(f"\n{'='*40}\nProcessing {asset}\n{'='*40}")
-        
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
+    def fetch_data(self, symbol):
         try:
-            df = dm.fetch_data(asset)
-            if df is None or df.empty:
-                continue
-                
-            df = dm.add_indicators(df)
-            if df is None or df.empty:
-                continue
-                
-            X, y = bt.prepare_data(df)
-            if X is None or y is None:
-                continue
-                
-            prices = df['close'].iloc[1:]
-            
-            for model_type in MODEL_CONFIG.keys():
-                print(f"\nTraining {model_type}...")
-                try:
-                    model = ModelForge.create_model(model_type, (1, X.shape[1]))
-                    if model is None:
-                        continue
-                        
-                    bt.train_model(model, model_type, X, y)
-                    sharpe = bt.backtest(model, model_type, X, y, prices)
-                    
-                    if sharpe > 0.5:
-                        bt.save_model(model, model_type, asset)
-                        print(f"Saved {model_type} for {asset} (Sharpe: {sharpe:.2f})")
-                        
-                except Exception as e:
-                    print(f"{model_type} training failed: {str(e)}")
-                    
+            elapsed = time.time() - self.last_fetch_time
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            df = self.td.time_series(
+                symbol=symbol,
+                interval='1day',
+                start_date='2010-01-01',
+                outputsize=5000
+            ).as_pandas()
+            self.last_fetch_time = time.time()
+            df.sort_index(inplace=True)
+            for col in ['open', 'high', 'low', 'close']:
+                if col not in df.columns:
+                    raise ValueError(f"Missing essential column: {col}")
+            if 'volume' not in df.columns:
+                logging.info(f"{symbol}: Volume column not found. Adding a default volume column.")
+                df['volume'] = 1
+            return df
         except Exception as e:
-            print(f"Fatal error processing {asset}: {str(e)}")
+            logging.error(f"Fetch failed for {symbol}: {str(e)}")
+            raise
+
+    def preprocess_data(self, df):
+        if df is None or df.empty:
+            logging.error("Empty dataframe.")
+            return None, None, None
+        try:
+            df.ta.strategy(ta.Strategy(name="Dynamic Strategy", description="Auto indicators", ta=INDICATOR_CONFIG))
+        except Exception as e:
+            logging.error(f"Indicator error: {str(e)}")
+            return None, None, None
+        df = df.ffill().bfill().dropna(axis=1, how='all')
+        if len(df) < 100:
+            logging.error("Not enough data after preprocessing.")
+            return None, None, None
+        features = self.scaler.fit_transform(df.drop(['close'], axis=1, errors='ignore'))
+        target = (df['close'].pct_change().shift(-1) > 0).astype(int)
+        return features[:-1], target[:-1], df['close'].iloc[1:]
+
+##############################
+# Model Factory
+##############################
+class ModelFactory:
+    @staticmethod
+    def create_model(model_type, input_shape=None):
+        try:
+            if model_type == 'LSTM':
+                inp = Input(shape=input_shape)
+                x = LSTM(MODEL_CONFIG['LSTM']['units'])(inp)
+                x = Dropout(MODEL_CONFIG['LSTM']['dropout'])(x)
+                out = Dense(1, activation='sigmoid')(x)
+                model = Model(inputs=inp, outputs=out)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['LSTM']['learning_rate']),
+                              loss='binary_crossentropy')
+                return model
+            elif model_type == 'GRU':
+                inp = Input(shape=input_shape)
+                x = GRU(MODEL_CONFIG['GRU']['units'])(inp)
+                x = Dropout(MODEL_CONFIG['GRU']['dropout'])(x)
+                out = Dense(1, activation='sigmoid')(x)
+                model = Model(inputs=inp, outputs=out)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['GRU']['learning_rate']),
+                              loss='binary_crossentropy')
+                return model
+            elif model_type == 'CNN':
+                inp = Input(shape=input_shape)
+                x = Conv1D(filters=MODEL_CONFIG['CNN']['filters'], kernel_size=MODEL_CONFIG['CNN']['kernel_size'], activation='relu')(inp)
+                x = GlobalMaxPooling1D()(x)
+                out = Dense(1, activation='sigmoid')(x)
+                model = Model(inputs=inp, outputs=out)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['CNN']['learning_rate']),
+                              loss='binary_crossentropy')
+                return model
+            elif model_type == 'Transformer':
+                inp = Input(shape=input_shape)
+                x = MultiHeadAttention(num_heads=MODEL_CONFIG['Transformer']['heads'],
+                                       key_dim=MODEL_CONFIG['Transformer']['key_dim'])(inp, inp)
+                x = LayerNormalization(epsilon=1e-6)(x)
+                x = GlobalMaxPooling1D()(x)
+                x = Dense(64, activation='relu')(x)
+                out = Dense(1, activation='sigmoid')(x)
+                model = Model(inputs=inp, outputs=out)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['Transformer']['learning_rate']),
+                              loss='binary_crossentropy')
+                return model
+            elif model_type in ['XGBoost']:
+                # Regression-based model.
+                model = XGBRegressor(**MODEL_CONFIG['XGBoost'])
+                return model
+            elif model_type == 'LightGBM':
+                # Train using lgb.train to get a Booster.
+                return None  # Creation handled in training branch.
+            elif model_type == 'CatBoost':
+                model = CatBoostRegressor(**MODEL_CONFIG['CatBoost'])
+                return model
+            elif model_type == 'Stacking':
+                # Example stacking of XGB and LightGBM.
+                estimators = [
+                    ('xgb', XGBRegressor(n_estimators=100)),
+                    ('lgbm', XGBRegressor(n_estimators=100))  # substitute with proper LightGBM if desired.
+                ]
+                model = StackingRegressor(estimators=estimators, final_estimator=CatBoostRegressor(iterations=100))
+                return model
+            elif model_type == 'GaussianProcess':
+                model = GaussianProcessRegressor()
+                return model
+            elif model_type == 'Prophet':
+                return Prophet()
+            elif model_type == 'Sentiment':
+                # Build a deep network similar to other deep models.
+                inp = Input(shape=input_shape)
+                x = Dense(64, activation='relu')(inp)
+                x = Dropout(0.3)(x)
+                out = Dense(1, activation='sigmoid')(x)
+                model = Model(inputs=inp, outputs=out)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['Sentiment']['learning_rate']),
+                              loss='binary_crossentropy')
+                return model
+            elif model_type == 'Anomaly':
+                # Autoencoder for anomaly detection.
+                inp = Input(shape=input_shape)
+                encoded = Dense(32, activation='relu')(inp)
+                decoded = Dense(input_shape[0], activation='linear')(encoded)
+                model = Model(inputs=inp, outputs=decoded)
+                model.compile(optimizer=Adam(learning_rate=MODEL_CONFIG['Anomaly']['learning_rate']),
+                              loss='mse')
+                return model
+            elif model_type == 'SVR':
+                model = SVR(C=MODEL_CONFIG['SVR']['C'], epsilon=MODEL_CONFIG['SVR']['epsilon'])
+                return model
+            elif model_type in ['DQN', 'PPO']:
+                # For RL, we'll instantiate the agent later after building the environment.
+                return None
+            else:
+                logging.error(f"Model type '{model_type}' not recognized.")
+                return None
+        except Exception as e:
+            logging.error(f"Model creation failed for {model_type}: {str(e)}")
+            return None
+
+##############################
+# Backtest Engine
+##############################
+class BacktestEngine:
+    def __init__(self):
+        self.results = pd.DataFrame()
+
+    def run_backtest(self, model, model_type, X, y, prices, dates=None, extra_data=None):
+        try:
+            # For deep models (LSTM, GRU, CNN, Transformer) use sequences.
+            if model_type in ['LSTM', 'GRU', 'CNN', 'Transformer']:
+                preds = model.predict(X).flatten()
+                prices_slice = prices.iloc[WINDOW_SIZE-1:WINDOW_SIZE-1+len(preds)]
+            # For Sentiment, use full features and do not apply the sequence offset.
+            elif model_type == 'Sentiment':
+                preds = model.predict(X).flatten()
+                prices_slice = prices  # Use the whole series.
+            elif model_type == 'Prophet':
+                prophet_df = pd.DataFrame({'ds': dates, 'y': prices.values})
+                model.fit(prophet_df)
+                forecast = model.predict(prophet_df)
+                preds = (forecast['yhat'].values > prices.values).astype(float)
+                prices_slice = prices
+            elif model_type == 'Anomaly':
+                recon = model.predict(X)
+                error = np.mean(np.abs(X - recon), axis=1)
+                preds = (error < np.percentile(error, 75)).astype(float)
+                prices_slice = prices
+            elif model_type in ['XGBoost', 'CatBoost', 'Stacking', 'GaussianProcess', 'SVR']:
+                # For regression/classification models.
+                preds_cont = model.predict(X)
+                preds = (preds_cont > 0).astype(float)
+                prices_slice = prices
+            elif model_type == 'LightGBM':
+                dtrain = lgb.Dataset(X, label=y)
+                booster = lgb.train(params={'learning_rate': MODEL_CONFIG['LightGBM']['learning_rate'],
+                                            'objective': 'regression'},
+                                    train_set=dtrain,
+                                    num_boost_round=MODEL_CONFIG['LightGBM']['num_boost_round'])
+                preds_cont = booster.predict(X)
+                preds = (preds_cont > 0).astype(float)
+                prices_slice = prices
+                model = booster  # Replace model with booster.
+            elif model_type in ['DQN', 'PPO']:
+                env = extra_data['env']
+                obs = env.reset()
+                actions = []
+                for _ in range(len(prices)-1):
+                    action, _states = model.predict(obs)
+                    actions.append(action)
+                    obs, _, done, _ = env.step(action)
+                    if done:
+                        break
+                preds = np.array(actions)
+                prices_slice = prices
+            else:
+                logging.error(f"Unknown model type during backtesting: {model_type}")
+                return None, None
+
+            portfolio = vbt.Portfolio.from_signals(
+                prices_slice,
+                entries=preds > 0.6,
+                exits=preds < 0.4,
+                fees=0.001,
+                slippage=0.005,
+                freq='1D'
+            )
+            stats = portfolio.stats().to_dict()
+            return stats, model
+        except Exception as e:
+            logging.error(f"Backtest failed for model {model_type}: {str(e)}")
+            return None, None
+
+##############################
+# Main Process – RL Branch Fix
+##############################
+def main():
+    data_master = DataMaster()
+    backtester = BacktestEngine()
+    model_factory = ModelFactory()
+    
+    all_assets = FOREX_PAIRS + CRYPTO_PAIRS
+    for asset in all_assets:
+        logging.info(f"Processing {asset}")
+        try:
+            df = data_master.fetch_data(asset)
+            X_raw, y, prices = data_master.preprocess_data(df)
+            if X_raw is None or y is None or prices is None:
+                logging.warning(f"Skipping {asset} due to insufficient data.")
+                continue
+            X_seq, y_seq = create_sequences(X_raw, y)
+            X_classical = X_raw.copy()
+            dates = prices.index
+            extra = {}
+            
+            for model_type in MODEL_LIST:
+                logging.info(f"Training {model_type} on {asset}")
+                try:
+                    model = None
+                    stats = None
+                    
+                    if model_type in ['LSTM', 'GRU', 'CNN', 'Transformer']:
+                        input_shape = (WINDOW_SIZE, X_raw.shape[1])
+                        model = model_factory.create_model(model_type, input_shape)
+                        if model is None:
+                            continue
+                        model.fit(X_seq, y_seq,
+                                  epochs=MODEL_CONFIG[model_type]['epochs'],
+                                  batch_size=MODEL_CONFIG[model_type]['batch_size'],
+                                  verbose=0)
+                        stats, model = backtester.run_backtest(model, model_type, X_seq, y_seq, prices, dates)
+                    elif model_type == 'Sentiment':
+                        input_shape = (X_classical.shape[1],)
+                        model = model_factory.create_model(model_type, input_shape)
+                        if model is None:
+                            continue
+                        model.fit(X_classical, y,
+                                  epochs=MODEL_CONFIG[model_type]['epochs'],
+                                  batch_size=MODEL_CONFIG[model_type]['batch_size'],
+                                  verbose=0)
+                        stats, model = backtester.run_backtest(model, model_type, X_classical, y, prices, dates)
+                    elif model_type == 'Anomaly':
+                        input_shape = (X_classical.shape[1],)
+                        model = model_factory.create_model(model_type, input_shape)
+                        if model is None:
+                            continue
+                        model.fit(X_classical, X_classical,
+                                  epochs=MODEL_CONFIG[model_type]['epochs'],
+                                  batch_size=MODEL_CONFIG[model_type]['batch_size'],
+                                  verbose=0)
+                        stats, model = backtester.run_backtest(model, model_type, X_classical, y, prices, dates)
+                    elif model_type in ['XGBoost', 'CatBoost', 'Stacking', 'GaussianProcess', 'SVR']:
+                        model = model_factory.create_model(model_type)
+                        if model is None:
+                            continue
+                        model.fit(X_classical, y)
+                        stats, model = backtester.run_backtest(model, model_type, X_classical, y, prices, dates)
+                    elif model_type == 'LightGBM':
+                        stats, model = backtester.run_backtest(None, model_type, X_classical, y, prices, dates)
+                    elif model_type == 'Prophet':
+                        model = model_factory.create_model(model_type)
+                        stats, model = backtester.run_backtest(model, model_type, X_classical, y, prices, dates)
+                    elif model_type in ['DQN', 'PPO']:
+                        env = TradingEnv(prices, X_classical)
+                        extra['env'] = env
+                        if model_type == 'DQN':
+                            # Remove the 'total_timesteps' key before passing config.
+                            dqn_config = MODEL_CONFIG['DQN'].copy()
+                            total_timesteps = dqn_config.pop('total_timesteps', 10000)
+                            agent = DQN("MlpPolicy", env, verbose=0, **dqn_config)
+                        else:
+                            ppo_config = MODEL_CONFIG['PPO'].copy()
+                            total_timesteps = ppo_config.pop('total_timesteps', 10000)
+                            agent = PPO("MlpPolicy", env, verbose=0, **ppo_config)
+                        agent.learn(total_timesteps=total_timesteps)
+                        model = agent
+                        stats, model = backtester.run_backtest(model, model_type, X_classical, y, prices, dates, extra)
+                    else:
+                        logging.error(f"Model type {model_type} not handled explicitly.")
+                        continue
+
+                    if stats:
+                        result_row = {'Asset': asset, 'Model': model_type}
+                        result_row.update(stats)
+                        backtester.results = pd.concat([backtester.results, pd.DataFrame([result_row])], ignore_index=True)
+                        # Save model using SAVE_CONFIG.
+                        save_conf = SAVE_CONFIG[model_type]
+                        filename = f"models/{asset.replace('/', '_')}_{model_type.lower()}_model{save_conf['ext']}"
+                        if save_conf['method'] == 'tf':
+                            tf.keras.models.save_model(model, filename)
+                        elif save_conf['method'] == 'xgb':
+                            model.save_model(filename)
+                        elif save_conf['method'] == 'lgb':
+                            model.save_model(filename)
+                        elif save_conf['method'] == 'catboost':
+                            model.save_model(filename)
+                        elif save_conf['method'] == 'joblib':
+                            joblib.dump(model, filename)
+                        elif save_conf['method'] == 'stable_baselines3':
+                            model.save(filename)
+                        logging.info(f"Saved {model_type} model for {asset} as {filename}")
+                    else:
+                        logging.warning(f"No stats generated for {asset} model {model_type}.")
+                except Exception as e:
+                    logging.error(f"Model {model_type} failed on {asset}: {str(e)}")
+            backtester.save_results()
+        except Exception as e:
+            logging.error(f"Asset {asset} processing failed: {str(e)}")
+            continue
+
+    # Save auxiliary components.
+    joblib.dump(data_master.scaler, 'models/price_scaler.pkl')
+    joblib.dump({"tokenizer": "dummy"}, 'models/sentiment_tokenizer.pkl')
+
+if __name__ == "__main__":
+    main()
