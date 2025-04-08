@@ -11,7 +11,7 @@ gnn_env/
 std_env/
 backtest_env/
 trading_env/
-
+b_env/
 # Distribution / packaging
 .Python
 build/

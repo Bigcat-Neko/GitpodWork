@@ -1,437 +1,455 @@
-# train_all_models.py
-
-# --- Core Imports ---
+71% of storage used … If you run out, you can't create, edit, and upload files. Get 100 GB of storage for $1.99 $0.49/month for 2 months.
 import os
-import time
-import joblib
-import subprocess
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import joblib
+import pickle
+
+# TensorFlow / Keras imports
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, InputLayer
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import gym
-import random
-import warnings
-from pathlib import Path
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Conv1D, MaxPooling1D, Flatten, Embedding, GlobalMaxPooling1D, Input, MultiHeadAttention, LayerNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-# --- Configuration ---
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-tf.config.threading.set_intra_op_parallelism_threads(1)
-tf.config.threading.set_inter_op_parallelism_threads(1)
-
-# --- ML Imports ---
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
+# Scikit-learn and others
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (mean_squared_error, accuracy_score, 
-                            classification_report, silhouette_score)
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
-from sklearn.cluster import KMeans
-from sklearn.gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
-from imblearn.over_sampling import SMOTE
-from statsmodels.tsa.arima.model import ARIMA
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
 
-# --- Data Loading ---
-def load_data():
-    print("Loading data...")
-    df = pd.read_csv('data/live_data.csv')
-    print("Data loaded!")
-    
-    # Feature engineering
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df = df.sort_values(['symbol', 'datetime'])
-    
-    # Create targets
-    df['next_close'] = df.groupby('symbol')['close'].shift(-1)
-    df['price_change'] = np.where(df['next_close'] > df['close'], 1, 0)
-    df = df.dropna()
-    
-    # Feature columns
-    ohlc_features = ['open', 'high', 'low', 'close']
-    
-    # Encode symbols
-    encoder = OneHotEncoder(sparse_output=False)
-    symbol_encoded = encoder.fit_transform(df[['symbol']])
-    
-    # Create feature matrix
-    X = np.concatenate([df[ohlc_features].values, symbol_encoded], axis=1)
-    y_reg = df['next_close'].values.reshape(-1, 1)
-    y_class = df['price_change'].values
-    
-    # Split data with larger test size
-    X_train, X_test, y_train, y_test = train_test_split(X, y_reg, test_size=0.3, random_state=42)
-    X_train_class, X_test_class, y_train_class, y_test_class = train_test_split(X, y_class, test_size=0.3, random_state=42)
-    
-    # Handle class imbalance with dynamic SMOTE
-    print("\nInitial class distribution:", np.bincount(y_train_class))
-    class_counts = np.bincount(y_train_class)
-    
-    if len(class_counts) > 1 and min(class_counts) > 1:
-        minority_count = min(class_counts)
-        k_neighbors = min(5, minority_count - 1)
-        
-        print(f"Applying SMOTE with k_neighbors={k_neighbors}")
-        smote = SMOTE(k_neighbors=k_neighbors)
-        X_train_class, y_train_class = smote.fit_resample(X_train_class, y_train_class)
-        print("Post-SMOTE distribution:", np.bincount(y_train_class))
-    else:
-        print("Insufficient samples for SMOTE. Using original distribution.")
-    
-    # Scaling
-    x_scaler = MinMaxScaler()
-    y_scaler = MinMaxScaler()
-    X_train = x_scaler.fit_transform(X_train)
-    X_test = x_scaler.transform(X_test)
-    y_train = y_scaler.fit_transform(y_train)
-    y_test = y_scaler.transform(y_test)
-    
-    return (X_train, X_test, y_train, y_test,
-            X_train_class, X_test_class, y_train_class, y_test_class,
-            x_scaler, y_scaler)
+# LightGBM, XGBoost, CatBoost
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostRegressor
 
-# --- Time Series Models ---
-def train_time_series_models(X_train, y_train, X_test, y_test):
-    print("\n=== Training Time Series Models ===")
+# Prophet (install via: pip install prophet)
+from prophet import Prophet
+
+# Reinforcement Learning (Stable-Baselines3)
+import gym
+from stable_baselines3 import PPO, DQN, A2C, SAC
+
+# Import your custom trading environment and feature engineering module
+from trading_env import TradingEnv
+from preprocess_features import create_features_targets
+
+# =============================================================================
+# Utility: Load Price Data
+# =============================================================================
+DATA_PATH = "data/forex_data_preprocessed.csv"
+def load_price_data():
+    return pd.read_csv(DATA_PATH, parse_dates=["date", "fetched_at"])
+
+# =============================================================================
+# 1. Deep Learning Models for Price Data
+# =============================================================================
+
+# ---------- A. LSTM Model ----------
+def train_lstm():
+    print("\n===== Training LSTM Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Use an Input layer rather than passing input_shape in first layer directly
+    model = Sequential([
+        tf.keras.Input(shape=(X_train.shape[1], X_train.shape[2])),
+        LSTM(50, return_sequences=True),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(25, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/lstm_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+    ]
+    model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
+              callbacks=callbacks, verbose=1)
+    model.save("models/lstm_model.keras")
+    print("LSTM model saved as models/lstm_model.keras")
+
+# ---------- B. GRU Model ----------
+def train_gru():
+    print("\n===== Training GRU Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = Sequential([
+        tf.keras.Input(shape=(X_train.shape[1], X_train.shape[2])),
+        GRU(50, return_sequences=True),
+        Dropout(0.2),
+        GRU(50),
+        Dropout(0.2),
+        Dense(25, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/gru_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+    ]
+    model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
+              callbacks=callbacks, verbose=1)
+    model.save("models/gru_model.keras")
+    print("GRU model saved as models/gru_model.keras")
+
+# ---------- C. CNN Model ----------
+def train_cnn():
+    print("\n===== Training CNN Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = Sequential([
+        tf.keras.Input(shape=(X_train.shape[1], 1)),
+        Conv1D(32, kernel_size=3, activation='relu'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.2),
+        Conv1D(64, kernel_size=3, activation='relu'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.2),
+        Flatten(),
+        Dense(50, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/cnn_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+    ]
+    model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
+              callbacks=callbacks, verbose=1)
+    model.save("models/cnn_model.keras")
+    print("CNN model saved as models/cnn_model.keras")
+
+# ---------- D. Transformer Model for Time Series ----------
+def train_transformer():
+    print("\n===== Training Transformer Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # LSTM with improved configuration
-    try:
-        print("\nTraining LSTM...")
-        X_train_lstm = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
-        X_test_lstm = X_test.reshape((X_test.shape[0], X_test.shape[1], 1))
-        
-        model = Sequential([
-            InputLayer(input_shape=(X_train_lstm.shape[1], 1)),
-            LSTM(64, activation='tanh', return_sequences=True),
-            LSTM(32, activation='tanh'),
-            Dense(1)
-        ])
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), 
-                     loss='mse',
-                     metrics=['mae'])
-        
-        history = model.fit(X_train_lstm, y_train, 
-                          epochs=100, 
-                          batch_size=32,
-                          validation_split=0.2,
-                          verbose=1)
-        
-        model.save(MODEL_DIR/"lstm_model.keras")
-        print("LSTM training complete. Model saved.")
-        
-    except Exception as e:
-        print(f"LSTM Error: {str(e)}")
+    input_layer = Input(shape=(X_train.shape[1], 1))
+    attn_output = MultiHeadAttention(num_heads=2, key_dim=32)(input_layer, input_layer)
+    attn_output = LayerNormalization(epsilon=1e-6)(attn_output + input_layer)
+    ffn_output = Dense(64, activation="relu")(attn_output)
+    ffn_output = Dense(1)(ffn_output)
+    gap = GlobalMaxPooling1D()(ffn_output)
+    output_layer = Dense(1, activation="linear")(gap)
+    transformer_model = Model(inputs=input_layer, outputs=output_layer)
+    transformer_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
     
-    # ARIMA with validation
-    try:
-        print("\nTraining ARIMA...")
-        arima = ARIMA(y_train, order=(1,1,1))
-        arima_fit = arima.fit()
-        print(f"ARIMA AIC: {arima_fit.aic:.2f}, BIC: {arima_fit.bic:.2f}")
-        joblib.dump(arima_fit, MODEL_DIR/"arima_model.pkl")
-        print("ARIMA model saved")
-    except Exception as e:
-        print(f"ARIMA Error: {str(e)}")
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/transformer_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+    ]
+    
+    transformer_model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
+                           callbacks=callbacks, verbose=1)
+    transformer_model.save("models/transformer_model.keras")
+    print("Transformer model saved as models/transformer_model.keras")
 
-# --- Reinforcement Learning Models ---
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
+# =============================================================================
+# 2. Sentiment Model (Using sentiment_data.csv) – Faster Version
+# =============================================================================
+def train_sentiment():
+    print("\n===== Training Sentiment Model =====")
+    sentiment_path = "data/sentiment_data.csv"
+    if not os.path.exists(sentiment_path):
+        raise FileNotFoundError(f"{sentiment_path} not found. Please ensure sentiment data is available.")
+    df = pd.read_csv(sentiment_path)
+    texts = df['text'].astype(str).values
+    labels = df['sentiment'].values
 
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity
+    # Reduce complexity: smaller vocab and shorter sequences
+    max_words = 3000
+    max_len = 80
 
-    def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
+    tokenizer = Tokenizer(num_words=max_words)
+    tokenizer.fit_on_texts(texts)
+    sequences = tokenizer.texts_to_sequences(texts)
+    X = pad_sequences(sequences, maxlen=max_len)
+    y = labels
 
-    def __len__(self):
-        return len(self.buffer)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-class DQN(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_dim)
+    model = Sequential([
+        tf.keras.Input(shape=(max_len,)),
+        Embedding(input_dim=max_words, output_dim=64),
+        LSTM(64, return_sequences=True),
+        Dropout(0.4),
+        GlobalMaxPooling1D(),
+        Dense(32, activation='relu'),
+        Dropout(0.4),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True, verbose=1),
+        ModelCheckpoint("models/sentiment_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1)
+    ]
+    # Train for fewer epochs to speed up training
+    model.fit(X_train, y_train, epochs=10, batch_size=64, validation_data=(X_val, y_val),
+              callbacks=callbacks, verbose=1)
+    joblib.dump(tokenizer, "models/sentiment_tokenizer.pkl")
+    model.save("models/sentiment_model.keras")
+    print("Sentiment model saved as models/sentiment_model.keras")
+    print("Sentiment tokenizer saved as models/sentiment_tokenizer.pkl")
 
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+# =============================================================================
+# 3. Price Scaler Model
+# =============================================================================
+def train_price_scaler():
+    print("\n===== Training Price Scaler Model =====")
+    data = load_price_data()
+    prices = data['close'].values.reshape(-1, 1)
+    scaler = RobustScaler()
+    scaler.fit(prices)
+    joblib.dump(scaler, "models/price_scaler.pkl")
+    print("Price scaler saved as models/price_scaler.pkl")
+
+# =============================================================================
+# 4. Anomaly Model (Using Autoencoder)
+# =============================================================================
+def train_anomaly():
+    print("\n===== Training Anomaly Model =====")
+    data = load_price_data()
+    prices = data['close'].values.reshape(-1, 1)
+    window_size = 10
+    X = [prices[i:i+window_size].flatten() for i in range(len(prices) - window_size)]
+    X = np.array(X)
+    X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
+    input_dim = X_train.shape[1]
+    encoding_dim = 5
+    autoencoder = Sequential([
+        tf.keras.Input(shape=(input_dim,)),
+        Dense(encoding_dim, activation='relu'),
+        Dense(input_dim, activation='linear')
+    ])
+    autoencoder.compile(optimizer='adam', loss='mse')
+    autoencoder.fit(X_train, X_train, epochs=50, batch_size=32, validation_data=(X_val, X_val), verbose=1)
+    autoencoder.save("models/anomaly_model.keras")
+    print("Anomaly model saved as models/anomaly_model.keras")
+
+# =============================================================================
+# 5. Traditional ML Models: LightGBM, XGBoost, CatBoost, SVR, Gaussian Process, Stacking
+# =============================================================================
+def train_lightgbm():
+    print("\n===== Training LightGBM Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+    params = {
+        'objective': 'regression',
+        'metric': 'rmse',
+        'boosting': 'gbdt',
+        'learning_rate': 0.05,
+        'num_leaves': 31,
+        'verbose': -1
+    }
+    lgb_model = lgb.train(params, train_data, num_boost_round=200,
+                          valid_sets=[val_data],
+                          callbacks=[lgb.early_stopping(stopping_rounds=20)])
+    y_pred = lgb_model.predict(X_val, num_iteration=lgb_model.best_iteration)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("LightGBM Validation RMSE:", rmse)
+    lgb_model.save_model("models/lightgbm_model.txt")
+    print("LightGBM model saved as models/lightgbm_model.txt")
+
+def train_xgboost():
+    print("\n===== Training XGBoost Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
+    params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'learning_rate': 0.05,
+        'max_depth': 6
+    }
+    evallist = [(dval, 'eval')]
+    xgb_model = xgb.train(params, dtrain, num_boost_round=200, evals=evallist, early_stopping_rounds=20)
+    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_ntree_limit)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("XGBoost Validation RMSE:", rmse)
+    xgb_model.save_model("models/xgboost_model.json")
+    print("XGBoost model saved as models/xgboost_model.json")
+
+def train_catboost():
+    print("\n===== Training CatBoost Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    cat_model = CatBoostRegressor(iterations=200, learning_rate=0.05, depth=6, verbose=50)
+    cat_model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=20)
+    y_pred = cat_model.predict(X_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("CatBoost Validation RMSE:", rmse)
+    cat_model.save_model("models/catboost_model.cbm")
+    print("CatBoost model saved as models/catboost_model.cbm")
+
+def train_svm():
+    print("\n===== Training SVR Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    from sklearn.svm import SVR
+    svr = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
+    svr.fit(X_train, y_train)
+    y_pred = svr.predict(X_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("SVR Validation RMSE:", rmse)
+    joblib.dump(svr, "models/svr_model.pkl")
+    print("SVR model saved as models/svr_model.pkl")
+
+def train_gaussian_process():
+    print("\n===== Training Gaussian Process Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    kernel = RBF(length_scale=1.0)
+    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+    gp.fit(X_train, y_train)
+    y_pred, std = gp.predict(X_val, return_std=True)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("Gaussian Process Validation RMSE:", rmse)
+    joblib.dump(gp, "models/gaussian_process_model.pkl")
+    print("Gaussian Process model saved as models/gaussian_process_model.pkl")
+
+def train_stacking():
+    print("\n===== Training Stacking Model =====")
+    data = load_price_data()
+    X, y = create_features_targets(data, window_size=10)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+    from sklearn.linear_model import LinearRegression
+    base_models = [
+        ('rf', RandomForestRegressor(n_estimators=100, random_state=42))
+    ]
+    meta_model = LinearRegression()
+    stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model, cv=5)
+    stacking_model.fit(X_train, y_train)
+    y_pred = stacking_model.predict(X_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+    print("Stacking Model Validation RMSE:", rmse)
+    joblib.dump(stacking_model, "models/stacking_model.pkl")
+    print("Stacking model saved as models/stacking_model.pkl")
+
+# =============================================================================
+# 6. Prophet Model (Time Series Forecasting)
+# =============================================================================
+def train_prophet():
+    print("\n===== Training Prophet Model =====")
+    data = load_price_data()
+    # Prophet expects a DataFrame with columns 'ds' (datetime) and 'y' (target)
+    df_prophet = data[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
+    m = Prophet()
+    m.fit(df_prophet)
+    with open("models/prophet_model.pkl", "wb") as f:
+        pickle.dump(m, f)
+    print("Prophet model saved as models/prophet_model.pkl")
+
+# =============================================================================
+# 7. Reinforcement Learning Models: PPO, DQN, A2C, SAC
+# =============================================================================
+def train_ppo():
+    print("\n===== Training PPO Model =====")
+    env = TradingEnv()
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=50000)
+    model.save("models/ppo_model")
+    print("PPO model saved as models/ppo_model")
 
 def train_dqn():
-    print("\n=== Training DQN ===")
-    try:
-        env = gym.make("CartPole-v1")
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.n
-        
-        dqn_net = DQN(state_dim, action_dim)
-        target_net = DQN(state_dim, action_dim)
-        target_net.load_state_dict(dqn_net.state_dict())
-        
-        optimizer = torch.optim.Adam(dqn_net.parameters(), lr=1e-3)
-        replay_buffer = ReplayBuffer(10000)
-        
-        gamma = 0.99
-        epsilon_start = 1.0
-        epsilon_final = 0.01
-        epsilon_decay = 500
-        frame_idx = 0
+    print("\n===== Training DQN Model =====")
+    env = TradingEnv()
+    model = DQN("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=50000)
+    model.save("models/dqn_model")
+    print("DQN model saved as models/dqn_model")
 
-        def epsilon_by_frame(frame_idx):
-            return epsilon_final + (epsilon_start - epsilon_final) * np.exp(-1. * frame_idx / epsilon_decay)
-        
-        for episode in range(50):
-            state, _ = env.reset()
-            episode_reward = 0
-            done = False
-            while not done:
-                epsilon = epsilon_by_frame(frame_idx)
-                frame_idx += 1
-                if random.random() > epsilon:
-                    with torch.no_grad():
-                        state_tensor = torch.FloatTensor(state).unsqueeze(0)
-                        q_values = dqn_net(state_tensor)
-                        action = q_values.max(1)[1].item()
-                else:
-                    action = env.action_space.sample()
-                
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                replay_buffer.push(state, action, reward, next_state, done)
-                state = next_state
-                episode_reward += reward
+def train_a2c():
+    print("\n===== Training A2C Model =====")
+    env = TradingEnv()
+    model = A2C("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=50000)
+    model.save("models/a2c_model")
+    print("A2C model saved as models/a2c_model")
 
-                if len(replay_buffer) > 64:
-                    batch = replay_buffer.sample(64)
-                    states, actions, rewards, next_states, dones = zip(*batch)
-                    
-                    states = torch.FloatTensor(states)
-                    actions = torch.LongTensor(actions).unsqueeze(1)
-                    rewards = torch.FloatTensor(rewards).unsqueeze(1)
-                    next_states = torch.FloatTensor(next_states)
-                    dones = torch.FloatTensor(dones).unsqueeze(1)
-                    
-                    current_q = dqn_net(states).gather(1, actions)
-                    next_q = target_net(next_states).max(1)[0].unsqueeze(1)
-                    expected_q = rewards + gamma * next_q * (1 - dones)
-                    
-                    loss = nn.MSELoss()(current_q, expected_q)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-            if episode % 10 == 0:
-                target_net.load_state_dict(dqn_net.state_dict())
-                print(f"Episode {episode} Reward: {episode_reward}")
-        
-        torch.save(dqn_net.state_dict(), MODEL_DIR/"dqn_model.pth")
-        env.close()
-    except Exception as e:
-        print(f"DQN Error: {str(e)}")
+def train_sac():
+    print("\n===== Training SAC Model =====")
+    env = TradingEnv()  # Ensure your env supports continuous actions for SAC
+    model = SAC("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=50000)
+    model.save("models/sac_model")
+    print("SAC model saved as models/sac_model")
 
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(ActorCritic, self).__init__()
-        self.fc = nn.Linear(state_dim, 128)
-        self.policy_head = nn.Linear(128, action_dim)
-        self.value_head = nn.Linear(128, 1)
+# =============================================================================
+# 8. Graph Neural Network (Placeholder)
+# =============================================================================
+def train_gnn():
+    print("\n===== Training Graph Neural Network Model =====")
+    print("GNN training requires specialized libraries (e.g., PyTorch Geometric or DGL) and a dedicated data pipeline.")
+    print("This function is a placeholder. Implement GNN training when you have the appropriate dataset and libraries.")
 
-    def forward(self, x):
-        x = torch.tanh(self.fc(x))
-        return self.policy_head(x), self.value_head(x)
-
-def train_ppo():
-    print("\n=== Training PPO ===")
-    try:
-        env = gym.make("CartPole-v1")
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.n
-        
-        model = ActorCritic(state_dim, action_dim)
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-        
-        gamma = 0.99
-        lam = 0.95
-
-        def compute_gae(rewards, masks, values):
-            returns = []
-            gae = 0
-            for step in reversed(range(len(rewards))):
-                delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
-                gae = delta + gamma * lam * masks[step] * gae
-                returns.insert(0, gae + values[step])
-            return returns
-
-        batch_states, batch_actions, batch_log_probs, batch_rewards, batch_masks, batch_values = [], [], [], [], [], []
-        timestep = 0
-        
-        for episode in range(50):
-            state, _ = env.reset()
-            episode_reward = 0
-            done = False
-            while not done:
-                state_tensor = torch.FloatTensor(state).unsqueeze(0)
-                logits, value = model(state_tensor)
-                probs = torch.softmax(logits, dim=1)
-                dist = torch.distributions.Categorical(probs)
-                action = dist.sample().item()
-                log_prob = dist.log_prob(torch.tensor(action))
-                
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                batch_states.append(state)
-                batch_actions.append(action)
-                batch_log_probs.append(log_prob)
-                batch_rewards.append(reward)
-                batch_masks.append(1 - int(done))
-                batch_values.append(value.item())
-                
-                state = next_state
-                episode_reward += reward
-                timestep += 1
-                
-                if timestep % 2000 == 0:
-                    state_tensor = torch.FloatTensor(state).unsqueeze(0)
-                    _, next_value = model(state_tensor)
-                    batch_values.append(next_value.item())
-                    
-                    returns = compute_gae(batch_rewards, batch_masks, batch_values)
-                    returns = torch.FloatTensor(returns)
-                    
-                    batch_states_tensor = torch.FloatTensor(batch_states)
-                    batch_actions_tensor = torch.LongTensor(batch_actions)
-                    batch_log_probs_tensor = torch.stack(batch_log_probs)
-                    
-                    for _ in range(10):
-                        logits, values = model(batch_states_tensor)
-                        probs = torch.softmax(logits, dim=1)
-                        dist = torch.distributions.Categorical(probs)
-                        new_log_probs = dist.log_prob(batch_actions_tensor)
-                        
-                        ratio = torch.exp(new_log_probs - batch_log_probs_tensor)
-                        advantage = returns - values.squeeze()
-                        
-                        surr1 = ratio * advantage
-                        surr2 = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2) * advantage
-                        
-                        loss = -torch.min(surr1, surr2).mean() + 0.5 * (returns - values.squeeze()).pow(2).mean()
-                        
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                    
-                    batch_states, batch_actions, batch_log_probs, batch_rewards, batch_masks, batch_values = [], [], [], [], [], []
-                    timestep = 0
-            
-            print(f"Episode {episode} Reward: {episode_reward}")
-        
-        torch.save(model.state_dict(), MODEL_DIR/"ppo_model.pth")
-        env.close()
-    except Exception as e:
-        print(f"PPO Error: {str(e)}")
-
-def train_reinforcement_learning_models():
-    train_dqn()
-    train_ppo()
-
-# --- Classification/Regression Models ---
-def train_classification_regression_models(X_train, X_test, y_train, y_test, X_train_class, X_test_class, y_train_class, y_test_class):
-    print("\n=== Training Classification & Regression Models ===")
-    
-    # Classification with cross-validation
-    try:
-        print("\nTraining Random Forest with cross-validation...")
-        rf = RandomForestClassifier(n_estimators=100, random_state=42)
-        rf.fit(X_train_class, y_train_class)
-        joblib.dump(rf, MODEL_DIR/"rf_classifier.pkl")
-        print("Random Forest Report:\n", classification_report(y_test_class, rf.predict(X_test_class)))
-    except Exception as e:
-        print(f"RF Error: {str(e)}")
-
-    try:
-        print("\nTraining Logistic Regression...")
-        logreg = LogisticRegression(max_iter=1000, class_weight='balanced')
-        logreg.fit(X_train_class, y_train_class)
-        joblib.dump(logreg, MODEL_DIR/"logreg_classifier.pkl")
-        print("Logistic Regression Report:\n", classification_report(y_test_class, logreg.predict(X_test_class)))
-    except Exception as e:
-        print(f"LogReg Error: {str(e)}")
-
-    # Regression with improved configuration
-    try:
-        print("\nTraining Linear Regression...")
-        lin_reg = LinearRegression()
-        lin_reg.fit(X_train, y_train)
-        joblib.dump(lin_reg, MODEL_DIR/"linear_regressor.pkl")
-        print(f"Linear MSE: {mean_squared_error(y_test, lin_reg.predict(X_test)):.4f}")
-    except Exception as e:
-        print(f"Linear Reg Error: {str(e)}")
-
-    try:
-        print("\nTraining Gradient Boosting...")
-        gbr = GradientBoostingRegressor(n_estimators=200, learning_rate=0.1)
-        gbr.fit(X_train, y_train)
-        joblib.dump(gbr, MODEL_DIR/"gbr_regressor.pkl")
-        print(f"GBoost MSE: {mean_squared_error(y_test, gbr.predict(X_test)):.4f}")
-    except Exception as e:
-        print(f"GBoost Error: {str(e)}")
-
-# --- Clustering Models ---
-def train_clustering_models(X_scaled):
-    print("\n=== Training Clustering Model ===")
-    try:
-        scaler = StandardScaler()
-        X_cluster = scaler.fit_transform(X_scaled)
-        
-        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-        kmeans.fit(X_cluster)
-        joblib.dump(kmeans, MODEL_DIR/"kmeans_model.pkl")
-        
-        print(f"Silhouette Score: {silhouette_score(X_cluster, kmeans.labels_):.4f}")
-        print("Cluster Centers (Original Scale):")
-        print(scaler.inverse_transform(kmeans.cluster_centers_))
-    except Exception as e:
-        print(f"Clustering Error: {str(e)}")
-
-# --- Main Execution ---
-def main():
-    (X_train, X_test, y_train, y_test,
-     X_train_class, X_test_class, y_train_class, y_test_class,
-     x_scaler, y_scaler) = load_data()
-    
-    start_time = time.time()
-    
-    train_time_series_models(X_train, y_train, X_test, y_test)
-    train_reinforcement_learning_models()
-    train_classification_regression_models(X_train, X_test, y_train, y_test,
-                                         X_train_class, X_test_class, y_train_class, y_test_class)
-    train_clustering_models(X_train)
-    
-    print(f"\nTotal Training Time: {time.time() - start_time:.2f} seconds")
-    
-    print("\nStarting conflict models...")
-    try:
-        subprocess.run(["python", "train_conflict_models.py"], check=True)
-    except Exception as e:
-        print(f"Conflict models error: {str(e)}")
-
+# =============================================================================
+# Main: Train all models in one go
+# =============================================================================
 if __name__ == "__main__":
-    main()
+    os.makedirs("models", exist_ok=True)
+    
+    # Deep Learning for price data
+    train_lstm()
+    train_gru()
+    train_cnn()
+    train_transformer()
+    
+    # Sentiment model
+    train_sentiment()
+    
+    # Preprocessing models
+    train_price_scaler()
+    train_anomaly()
+    
+    # Traditional ML models
+    train_lightgbm()
+    train_xgboost()
+    train_catboost()
+    train_svm()
+    train_gaussian_process()
+    train_stacking()
+    
+    # Prophet forecasting model
+    train_prophet()
+    
+    # Reinforcement Learning models
+    train_ppo()
+    train_dqn()
+    train_a2c()
+    train_sac()
+    
+    # Placeholder for GNN
+    train_gnn()
+    
+    print("\nAll models have been trained and saved.")
