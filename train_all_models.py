@@ -1,12 +1,15 @@
-71% of storage used … If you run out, you can't create, edit, and upload files. Get 100 GB of storage for $1.99 $0.49/month for 2 months.
+#!/usr/bin/env python
 import os
 import numpy as np
 import pandas as pd
 import joblib
 import pickle
 
-# TensorFlow / Keras imports
+# Force TensorFlow to use CPU only.
 import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+
+# TensorFlow / Keras imports
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Conv1D, MaxPooling1D, Flatten, Embedding, GlobalMaxPooling1D, Input, MultiHeadAttention, LayerNormalization
 from tensorflow.keras.optimizers import Adam
@@ -36,7 +39,8 @@ from prophet import Prophet
 import gym
 from stable_baselines3 import PPO, DQN, A2C, SAC
 
-# Import your custom trading environment and feature engineering module
+# Import your custom modules for the trading environment and feature engineering
+# Make sure trading_env.py and preprocess_features.py are available in the same directory.
 from trading_env import TradingEnv
 from preprocess_features import create_features_targets
 
@@ -51,14 +55,13 @@ def load_price_data():
 # 1. Deep Learning Models for Price Data
 # =============================================================================
 
-# ---------- A. LSTM Model ----------
 def train_lstm():
     print("\n===== Training LSTM Model =====")
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
+    # Reshape for sequence models (samples, timesteps, features)
     X = X.reshape((X.shape[0], X.shape[1], 1))
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    # Use an Input layer rather than passing input_shape in first layer directly
     model = Sequential([
         tf.keras.Input(shape=(X_train.shape[1], X_train.shape[2])),
         LSTM(50, return_sequences=True),
@@ -79,7 +82,6 @@ def train_lstm():
     model.save("models/lstm_model.keras")
     print("LSTM model saved as models/lstm_model.keras")
 
-# ---------- B. GRU Model ----------
 def train_gru():
     print("\n===== Training GRU Model =====")
     data = load_price_data()
@@ -106,7 +108,6 @@ def train_gru():
     model.save("models/gru_model.keras")
     print("GRU model saved as models/gru_model.keras")
 
-# ---------- C. CNN Model ----------
 def train_cnn():
     print("\n===== Training CNN Model =====")
     data = load_price_data()
@@ -136,7 +137,6 @@ def train_cnn():
     model.save("models/cnn_model.keras")
     print("CNN model saved as models/cnn_model.keras")
 
-# ---------- D. Transformer Model for Time Series ----------
 def train_transformer():
     print("\n===== Training Transformer Model =====")
     data = load_price_data()
@@ -159,14 +159,13 @@ def train_transformer():
         ModelCheckpoint("models/transformer_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
     ]
-    
     transformer_model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val),
                            callbacks=callbacks, verbose=1)
     transformer_model.save("models/transformer_model.keras")
     print("Transformer model saved as models/transformer_model.keras")
 
 # =============================================================================
-# 2. Sentiment Model (Using sentiment_data.csv) – Faster Version
+# 2. Sentiment Model
 # =============================================================================
 def train_sentiment():
     print("\n===== Training Sentiment Model =====")
@@ -177,7 +176,6 @@ def train_sentiment():
     texts = df['text'].astype(str).values
     labels = df['sentiment'].values
 
-    # Reduce complexity: smaller vocab and shorter sequences
     max_words = 3000
     max_len = 80
 
@@ -205,7 +203,6 @@ def train_sentiment():
         ModelCheckpoint("models/sentiment_model.keras", monitor='val_loss', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1)
     ]
-    # Train for fewer epochs to speed up training
     model.fit(X_train, y_train, epochs=10, batch_size=64, validation_data=(X_val, y_val),
               callbacks=callbacks, verbose=1)
     joblib.dump(tokenizer, "models/sentiment_tokenizer.pkl")
@@ -226,7 +223,7 @@ def train_price_scaler():
     print("Price scaler saved as models/price_scaler.pkl")
 
 # =============================================================================
-# 4. Anomaly Model (Using Autoencoder)
+# 4. Anomaly Model (Autoencoder)
 # =============================================================================
 def train_anomaly():
     print("\n===== Training Anomaly Model =====")
@@ -249,7 +246,7 @@ def train_anomaly():
     print("Anomaly model saved as models/anomaly_model.keras")
 
 # =============================================================================
-# 5. Traditional ML Models: LightGBM, XGBoost, CatBoost, SVR, Gaussian Process, Stacking
+# 5. Traditional ML Models
 # =============================================================================
 def train_lightgbm():
     print("\n===== Training LightGBM Model =====")
@@ -314,7 +311,6 @@ def train_svm():
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    from sklearn.svm import SVR
     svr = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
     svr.fit(X_train, y_train)
     y_pred = svr.predict(X_val)
@@ -342,8 +338,6 @@ def train_stacking():
     data = load_price_data()
     X, y = create_features_targets(data, window_size=10)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    from sklearn.ensemble import RandomForestRegressor, StackingRegressor
-    from sklearn.linear_model import LinearRegression
     base_models = [
         ('rf', RandomForestRegressor(n_estimators=100, random_state=42))
     ]
@@ -362,7 +356,6 @@ def train_stacking():
 def train_prophet():
     print("\n===== Training Prophet Model =====")
     data = load_price_data()
-    # Prophet expects a DataFrame with columns 'ds' (datetime) and 'y' (target)
     df_prophet = data[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
     m = Prophet()
     m.fit(df_prophet)
@@ -371,11 +364,11 @@ def train_prophet():
     print("Prophet model saved as models/prophet_model.pkl")
 
 # =============================================================================
-# 7. Reinforcement Learning Models: PPO, DQN, A2C, SAC
+# 7. Reinforcement Learning Models
 # =============================================================================
 def train_ppo():
     print("\n===== Training PPO Model =====")
-    env = TradingEnv()
+    env = TradingEnv()  # Ensure TradingEnv has a proper interface
     model = PPO("MlpPolicy", env, verbose=1)
     model.learn(total_timesteps=50000)
     model.save("models/ppo_model")
@@ -399,7 +392,7 @@ def train_a2c():
 
 def train_sac():
     print("\n===== Training SAC Model =====")
-    env = TradingEnv()  # Ensure your env supports continuous actions for SAC
+    env = TradingEnv()  # Ensure that your environment supports the SAC settings
     model = SAC("MlpPolicy", env, verbose=1)
     model.learn(total_timesteps=50000)
     model.save("models/sac_model")
@@ -410,16 +403,16 @@ def train_sac():
 # =============================================================================
 def train_gnn():
     print("\n===== Training Graph Neural Network Model =====")
-    print("GNN training requires specialized libraries (e.g., PyTorch Geometric or DGL) and a dedicated data pipeline.")
-    print("This function is a placeholder. Implement GNN training when you have the appropriate dataset and libraries.")
+    print("GNN training requires specialized libraries (e.g., PyTorch Geometric or DGL).")
+    print("This is a placeholder. Implement GNN training when you have the proper dataset and libraries.")
 
 # =============================================================================
-# Main: Train all models in one go
+# Main: Train All Models
 # =============================================================================
 if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     
-    # Deep Learning for price data
+    # Deep learning models
     train_lstm()
     train_gru()
     train_cnn()
@@ -449,7 +442,7 @@ if __name__ == "__main__":
     train_a2c()
     train_sac()
     
-    # Placeholder for GNN
+    # Placeholder for GNN training
     train_gnn()
     
     print("\nAll models have been trained and saved.")
