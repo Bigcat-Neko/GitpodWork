@@ -287,7 +287,7 @@ def train_xgboost():
     }
     evallist = [(dval, 'eval')]
     xgb_model = xgb.train(params, dtrain, num_boost_round=200, evals=evallist, early_stopping_rounds=20)
-    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_ntree_limit)
+    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_iteration + 1)
     rmse = np.sqrt(mean_squared_error(y_val, y_pred))
     print("XGBoost Validation RMSE:", rmse)
     xgb_model.save_model("models/xgboost_model.json")
