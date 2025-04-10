@@ -164,7 +164,6 @@ tenacity
 tensorboard
 tensorboard-data-server
 tensorflow
-tensorflow-io-gcs-filesystem
 tensorflow_intel
 termcolor
 tf_keras

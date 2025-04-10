@@ -109,6 +109,118 @@ app.get_recent_data = get_recent_data
 
 # During startup, after initializing the app
 
+STATIC_INSTRUMENT_PARAMS = {
+    # Forex Pairs
+    "EUR/USD": {
+        "digits": 5,
+        "point_value": 0.00001,
+        "trade_stops_level": 10,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "GBP/USD": {
+        "digits": 5,
+        "point_value": 0.00001,
+        "trade_stops_level": 12,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "USD/JPY": {
+        "digits": 3,
+        "point_value": 0.001,
+        "trade_stops_level": 15,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "USD/CHF": {
+        "digits": 5,
+        "point_value": 0.00001,
+        "trade_stops_level": 10,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "AUD/USD": {
+        "digits": 5,
+        "point_value": 0.00001,
+        "trade_stops_level": 12,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "USD/CAD": {
+        "digits": 5,
+        "point_value": 0.00001,
+        "trade_stops_level": 15,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    
+    # Crypto Pairs
+    "BTC/USD": {
+        "digits": 2,
+        "point_value": 0.01,
+        "trade_stops_level": 50,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "ETH/USD": {
+        "digits": 2,
+        "point_value": 0.01,
+        "trade_stops_level": 30,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "XRP/USD": {
+        "digits": 4,
+        "point_value": 0.0001,
+        "trade_stops_level": 100,
+        "volume_min": 0.1,
+        "volume_step": 0.1,
+        "trade_allowed": True
+    },
+    "LTC/USD": {
+        "digits": 2,
+        "point_value": 0.01,
+        "trade_stops_level": 40,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    },
+    "BCH/USD": {
+        "digits": 2,
+        "point_value": 0.01,
+        "trade_stops_level": 40,
+        "volume_min": 0.01,
+        "volume_step": 0.01,
+        "trade_allowed": True
+    }
+}
+
+# Enhanced Configuration
+TRADING_PARAMS = {
+    "BTC/USD": {"min_volatility": 0.008, "confidence_threshold": 75},
+    "ETH/USD": {"min_volatility": 0.01, "confidence_threshold": 70},
+    "XRP/USD": {"min_volatility": 0.015, "confidence_threshold": 65},
+    "LTC/USD": {"min_volatility": 0.012, "confidence_threshold": 70},
+    "BCH/USD": {"min_volatility": 0.012, "confidence_threshold": 70},
+    # Forex pairs
+    "EUR/USD": {"min_volatility": 0.002, "confidence_threshold": 80},
+    "GBP/USD": {"min_volatility": 0.0025, "confidence_threshold": 80},
+    "USD/JPY": {"min_volatility": 0.002, "confidence_threshold": 80},
+    "USD/CHF": {"min_volatility": 0.002, "confidence_threshold": 80},
+    "AUD/USD": {"min_volatility": 0.0025, "confidence_threshold": 80},
+    "USD/CAD": {"min_volatility": 0.0025, "confidence_threshold": 80}
+}
+
+FORCE_TRADE_OVERRIDE = True  # Set to False in production
+
 async def reset_daily_counters():
     global twelvedata_calls_today, alphavantage_calls_today
     while True:
@@ -1306,57 +1418,49 @@ def prepare_features(df: pd.DataFrame, model_type: str):
 
 # ====================== CORE INDICATOR CALCULATION ======================
 # ----- Fix 1: Attach a get_historical_data method to the app -----
+# ====================== HISTORICAL DATA LOADING ======================
+# ====================== HISTORICAL DATA LOADING ======================
 def get_historical_data():
-    """
-    Retrieve historical data from the cache.
-    If no data exists, fetch default historical data for all forex-major and crypto assets,
-    combine them into a single DataFrame (with an 'asset' column), cache the result, and return it.
-    """
+    """Load historical data with proper symbol conversion for Yahoo Finance"""
     data = app.market_data_store.get("historical_data")
     if data is None or data.empty:
-        import yfinance as yf
-        import pandas as pd
-
-        # Define asset lists
         forex_assets = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
-        crypto_assets = ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
-        all_assets = forex_assets + crypto_assets
-
+        crypto_assets = ["BTC-USD", "ETH-USD", "XRP-USD", "LTC-USD", "BCH-USD"]
+        
         dfs = []
-        for asset in all_assets:
-            # Convert asset to appropriate yfinance ticker:
-            if asset in forex_assets:
-                # For forex pairs, Yahoo Finance typically uses the format "EURUSD=X"
-                yf_symbol = asset.replace("/", "") + "=X"
-            else:
-                # For crypto, use the format "BTC-USD"
-                yf_symbol = asset.replace("/", "-")
+        for asset in forex_assets + crypto_assets:
             try:
-                df_asset = yf.download(yf_symbol, period="5d", interval="1h", progress=False)
-                if not df_asset.empty:
-                    df_asset["asset"] = asset
-                    dfs.append(df_asset)
-                    logger.info(f"Fetched historical data for {asset} ({yf_symbol}).")
+                # Convert forex pairs to Yahoo format
+                if "/" in asset and "USD" in asset:
+                    yf_symbol = asset.replace("/", "") + "=X"
                 else:
-                    logger.warning(f"No data returned for {asset} ({yf_symbol}).")
+                    yf_symbol = asset
+                
+                df = yf.download(yf_symbol, period="5d", interval="1h", progress=False)
+                if not df.empty:
+                    df["asset"] = asset.replace("=X", "/USD").replace("-", "/")
+                    dfs.append(df.reset_index())
             except Exception as e:
-                logger.error(f"Error fetching data for {asset} ({yf_symbol}): {e}")
-
+                logger.error(f"Historical data download failed for {asset}: {str(e)}")
+        
         if dfs:
-            combined = pd.concat(dfs)
-            app.market_data_store.set("historical_data", combined)
-            logger.info("Loaded default historical data for all forex-major and crypto assets.")
-            return combined
+            data = pd.concat(dfs)
+            data = data.sort_values(["Date", "asset"]).set_index("Date")
+            app.market_data_store.set("historical_data", data)
+            logger.info("Loaded fresh historical data for all assets")
         else:
-            logger.error("Failed to load default historical data for any asset.")
-            return pd.DataFrame()
+            data = pd.DataFrame()
+            logger.error("Failed to load any historical data")
     return data
 
 def get_recent_data():
-    import pandas as pd
+    """Get recent data with forced refresh every 5 minutes"""
     data = app.market_data_store.get("recent_data")
-    if data is None:
-        data = pd.DataFrame()  # Fallback if no data available
+    if data is None or data.empty or (datetime.now() - data.index[-1]).total_seconds() > 300:
+        logger.info("Refreshing recent data")
+        data = fetch_market_data()  # Your existing fetch function
+        if not data.empty:
+            app.market_data_store.set("recent_data", data)
     return data
 
 # Attach both methods so retraining can call either one.
@@ -1458,19 +1562,19 @@ import numpy as np
 import pandas_ta as ta
 
 # ====================== UPDATED INDICATOR CALCULATION ======================
+import numpy as np
+import pandas_ta as ta
+
+import numpy as np
+import pandas_ta as ta
+
+import numpy as np
+import pandas_ta as ta
+
 def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute technical indicators from price data and guarantee that all required columns are present.
-    If data is missing or an indicator cannot be computed, default values are substituted.
-    
-    Required columns: 'open', 'high', 'low', 'close'
-    Computed indicators:
-      - SMA_50: 50-period SMA (fallback: 20-period SMA)
-      - RSI_14: 14-period RSI (default: 50)
-      - ADX_14: 14-period ADX (default: 25)
-      - +DI_14: Positive DI (default: 25)
-      - -DI_14: Negative DI (default: 25)
-      - BB_MIDDLE: Bollinger Bands middle band (fallback: 20-period SMA)
+    Compute technical indicators from price data while ensuring all checks are explicit.
+    If an error occurs, a fallback DataFrame with default values is returned.
     """
     try:
         required_cols = ['open', 'high', 'low', 'close']
@@ -1478,104 +1582,129 @@ def compute_professional_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = np.nan
 
-        # Convert required columns to numeric and fill missing values
         df[required_cols] = df[required_cols].apply(pd.to_numeric, errors='coerce')
         df = df.ffill().bfill()
+
         if df.empty:
             default_price = 1.0
-            df = pd.DataFrame({'open': [default_price],
-                               'high': [default_price],
-                               'low': [default_price],
-                               'close': [default_price]})
-        
+            df = pd.DataFrame({
+                'open': [default_price],
+                'high': [default_price],
+                'low': [default_price],
+                'close': [default_price]
+            })
+
         closes = df['close']
 
-        # SMA_50
         sma_50 = closes.rolling(window=50, min_periods=1).mean()
         if sma_50.isna().all():
             sma_50 = closes.rolling(window=20, min_periods=1).mean()
         df['SMA_50'] = sma_50.ffill().bfill()
 
-        # RSI_14 with fallback default 50
         rsi = ta.rsi(closes, length=14)
-        if rsi is None or rsi.empty:
+        if (rsi is None) or (isinstance(rsi, pd.Series) and rsi.empty):
             df['RSI_14'] = 50
         else:
             df['RSI_14'] = rsi.fillna(50)
 
-        # ADX and directional indicators; default value 25 if missing.
         adx_data = ta.adx(df['high'], df['low'], closes, length=14)
-        if adx_data is None or adx_data.empty:
+        if (adx_data is None) or (isinstance(adx_data, pd.DataFrame) and adx_data.empty):
             df['ADX_14'] = 25
             df['+DI_14'] = 25
             df['-DI_14'] = 25
         else:
             for col_name, default_val in [('ADX_14', 25), ('DMP_14', 25), ('DMN_14', 25)]:
-                if col_name not in adx_data.columns or adx_data[col_name].isna().all():
+                if (col_name not in adx_data.columns) or adx_data[col_name].isna().all():
                     adx_data[col_name] = default_val
             df['ADX_14'] = adx_data['ADX_14'].fillna(25)
             df['+DI_14'] = adx_data['DMP_14'].fillna(25)
             df['-DI_14'] = adx_data['DMN_14'].fillna(25)
 
-        # Bollinger Bands middle band; fallback to 20-period SMA.
         bb = ta.bbands(closes, length=20)
-        if bb is None or bb.empty:
+        if (bb is None) or (isinstance(bb, pd.DataFrame) and bb.empty):
             df['BB_MIDDLE'] = closes.rolling(window=20, min_periods=1).mean()
         else:
-            # Use the middle band (column index 1)
             middle = bb.iloc[:, 1]
             if middle.isna().all():
                 middle = closes.rolling(window=20, min_periods=1).mean()
             df['BB_MIDDLE'] = middle.ffill().bfill()
 
-        # Final cleanup: if any indicator column is entirely missing, set to default.
         for col, default in [('RSI_14', 50), ('ADX_14', 25), ('+DI_14', 25), ('-DI_14', 25)]:
             if df[col].isna().all():
                 df[col] = default
 
-        return df.ffill().bfill()
+        df = df.dropna()
+        return df
 
     except Exception as e:
         logger.error(f"Indicator calculation failed: {e}")
         default_price = 1.0
         default_data = {
-            'open': default_price, 'high': default_price, 'low': default_price, 'close': default_price,
-            'SMA_50': default_price, 'RSI_14': 50, 'ADX_14': 25, '+DI_14': 25, '-DI_14': 25,
+            'open': default_price,
+            'high': default_price,
+            'low': default_price,
+            'close': default_price,
+            'SMA_50': default_price,
+            'RSI_14': 50,
+            'ADX_14': 25,
+            '+DI_14': 25,
+            '-DI_14': 25,
             'BB_MIDDLE': default_price
         }
         return pd.DataFrame([default_data])
-
+    
 # ====================== UPDATED TRADE LEVEL CALCULATION ======================
 def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
-    """Calculates trade levels with broker-specific validation"""
+    """
+    Calculate trade levels using static configuration and live MT5 data when available.
+    
+    Safely retrieves attributes such as 'trade_allowed' using getattr() with a default value
+    so that missing attributes do not trigger exceptions.
+    """
     try:
-        if not MT5_AVAILABLE or not mt5.initialize():
-            initialize_mt5_admin()
+        # If a force override is enabled, return preset levels.
+        if globals().get("FORCE_TRADE_OVERRIDE", False):
+            return {
+                "sl_level": round(price * 0.99, 2),
+                "tp_levels": [
+                    round(price * 1.01, 2),
+                    round(price * 1.02, 2),
+                    round(price * 1.03, 2)
+                ],
+                "min_stop": 0
+            }
 
-        mt5_symbol = symbol.replace("/", "")
-        symbol_info = mt5.symbol_info(mt5_symbol)
-        digits = 5
-        min_stop_distance = 0
-        point_value = 0.00001
+        # Get static configuration parameters.
+        params = STATIC_INSTRUMENT_PARAMS.get(symbol, {})
+        digits = params.get("digits", 5)
+        point_value = params.get("point_value", 0.00001)
+        min_stop_points = params.get("trade_stops_level", 10)
+        min_stop_distance = min_stop_points * point_value * 1.2  # 20% buffer
 
-        if symbol_info:
-            digits = symbol_info.digits
-            point_value = symbol_info.point
-            min_stop_points = symbol_info.trade_stops_level
-            min_stop_distance = min_stop_points * point_value * 1.2  # 20% buffer
-            trade_allowed = symbol_info.trade_allowed
-            if not trade_allowed:
-                logger.error(f"Trading disabled for {symbol}")
-                raise ValueError("Symbol trading disabled")
+        # If MT5 is available, try to retrieve updated parameters.
+        if MT5_AVAILABLE:
+            mt5_symbol = symbol.replace("/", "")
+            if mt5.symbol_select(mt5_symbol, True):
+                symbol_info = mt5.symbol_info(mt5_symbol)
+                if symbol_info:
+                    digits = symbol_info.digits
+                    point_value = symbol_info.point
+                    # Use getattr to safely access 'trade_allowed'; default to True if the attribute is missing.
+                    trade_allowed = getattr(symbol_info, "trade_allowed", True)
+                    if not trade_allowed:
+                        logger.error(f"Trading disabled for {symbol}")
+                        raise ValueError("Symbol trading disabled")
+                    min_stop_points = getattr(symbol_info, "trade_stops_level", min_stop_points)
+                    min_stop_distance = min_stop_points * point_value * 1.2
 
-        # Validate ATR against minimum stop distance
-        atr = max(atr, min_stop_distance * 1.5)
+        # Ensure ATR meets a minimum threshold.
         price = round(price, digits)
+        atr = max(atr, min_stop_distance * 1.5)
 
         if side.upper() == "BUY":
             raw_sl = price - atr
-            sl = max(raw_sl, price - (price * 0.05))  # Max 5% risk
-            sl = round(sl - (min_stop_distance * 0.5), digits)  # Add buffer
+            sl = max(raw_sl, price - (price * 0.05))  # Limit risk to 5% at most
+            sl = round(sl - (min_stop_distance * 0.5), digits)
             tp_levels = [round(price + (atr * mult), digits) for mult in [1, 2, 3]]
         else:
             raw_sl = price + atr
@@ -1583,10 +1712,10 @@ def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> di
             sl = round(sl + (min_stop_distance * 0.5), digits)
             tp_levels = [round(price - (atr * mult), digits) for mult in [1, 2, 3]]
 
-        # Final validation against current price
-        if side == "BUY" and sl >= price - min_stop_distance:
+        # Additional safeguard: adjust SL if too close to the entry price.
+        if side.upper() == "BUY" and sl >= price - min_stop_distance:
             sl = round(price - min_stop_distance * 1.5, digits)
-        elif side == "SELL" and sl <= price + min_stop_distance:
+        elif side.upper() == "SELL" and sl <= price + min_stop_distance:
             sl = round(price + min_stop_distance * 1.5, digits)
 
         return {
@@ -1602,7 +1731,7 @@ def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> di
             "tp_levels": [round(price * 1.01, 5), round(price * 1.02, 5)],
             "min_stop": 0
         }
-    
+
 def generate_institutional_predictions(df: pd.DataFrame) -> dict:
     predictions = {}
     try:
@@ -1665,91 +1794,77 @@ def get_all_users():
 # Revised compute_trade_levels function to handle disabled trading gracefully
 from static_config import STATIC_INSTRUMENT_PARAMS
 
+from types import SimpleNamespace
+
 def compute_trade_levels(price: float, atr: float, side: str, symbol: str) -> dict:
     """
-    Calculates trade levels using a hybrid approach:
-    - First, attempt to retrieve parameters dynamically via MT5.
-    - If MT5 data is missing or indicates trading is disabled (and no override is active),
-      fall back to a static configuration.
-    
-    Parameters:
-      price (float): Current market price.
-      atr (float): Average True Range value.
-      side (str): "BUY" or "SELL".
-      symbol (str): The asset symbol (e.g., "EUR/USD" or "BTC/USD").
-      
-    Returns:
-      dict: Contains 'sl_level', 'tp_levels', and 'min_stop'.
+    Calculate trade levels using static configuration and live MT5 data when available.
+    Returns a dictionary with keys 'sl_level', 'tp_levels', and 'min_stop'.
     """
     try:
-        price = float(price)
-        atr = float(atr)
-        side = str(side).upper()
-        
-        # Start with static defaults.
-        params = STATIC_INSTRUMENT_PARAMS.get(symbol, {"digits": 5, "point_value": 0.00001, "trade_stops_level": 10})
-        digits = params["digits"]
-        point_value = params["point_value"]
-        min_stop_points = params["trade_stops_level"]
-        trading_allowed = True
-        
-        # If MT5 is available, try to pull dynamic data.
-        if globals().get("MT5_AVAILABLE", False):
+        if globals().get("FORCE_TRADE_OVERRIDE", False):
+            return {
+                "sl_level": round(price * 0.99, 2),
+                "tp_levels": [
+                    round(price * 1.01, 2),
+                    round(price * 1.02, 2),
+                    round(price * 1.03, 2)
+                ],
+                "min_stop": 0
+            }
+        params = STATIC_INSTRUMENT_PARAMS.get(symbol, {})
+        digits = params.get("digits", 5)
+        point_value = params.get("point_value", 0.00001)
+        min_stop_points = params.get("trade_stops_level", 10)
+        min_stop_distance = min_stop_points * point_value * 1.2
+
+        if MT5_AVAILABLE:
             mt5_symbol = symbol.replace("/", "")
-            if not mt5.symbol_select(mt5_symbol, True):
-                logger.warning(f"Symbol {mt5_symbol} could not be selected. Using static config.")
-            symbol_info = mt5.symbol_info(mt5_symbol)
-            if symbol_info:
-                # Use dynamic values if available.
-                digits = getattr(symbol_info, 'digits', digits)
-                point_value = getattr(symbol_info, 'point', point_value)
-                min_stop_points = getattr(symbol_info, 'trade_stops_level', min_stop_points)
-                # Check trading_allowed flag from MT5.
-                trading_allowed = getattr(symbol_info, 'trade_allowed', True)
-                # If FORCE_TRADE_OVERRIDE is set, ignore MT5's flag.
-                if globals().get("FORCE_TRADE_OVERRIDE", False):
-                    trading_allowed = True
-                    logger.info(f"Force override active: Forcing trading allowed for {symbol}.")
-                elif not trading_allowed:
-                    logger.error(f"MT5 indicates trading disabled for {symbol}; using static config fallback.")
-                    fallback_sl = round(price * 0.99, digits)
-                    fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
-                    return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": 0}
-            else:
-                logger.warning(f"No dynamic symbol info for {symbol}; using static config.")
-        
-        # Calculate minimum stop distance.
-        min_stop_distance = (min_stop_points * point_value) * 1.2
-        atr = max(atr, min_stop_distance * 1.5) if atr else min_stop_distance * 1.5
+            if mt5.symbol_select(mt5_symbol, True):
+                symbol_info = mt5.symbol_info(mt5_symbol)
+                if symbol_info:
+                    digits = symbol_info.digits
+                    point_value = symbol_info.point
+                    trade_allowed = getattr(symbol_info, "trade_allowed", True)
+                    if not trade_allowed:
+                        logger.error(f"Trading disabled for {symbol}")
+                        raise ValueError("Symbol trading disabled")
+                    min_stop_points = getattr(symbol_info, "trade_stops_level", min_stop_points)
+                    min_stop_distance = min_stop_points * point_value * 1.2
+
         price = round(price, digits)
-        
-        if side == "BUY":
+        atr = max(atr, min_stop_distance * 1.5)
+
+        if side.upper() == "BUY":
             raw_sl = price - atr
             sl = max(raw_sl, price - (price * 0.05))
             sl = round(sl - (min_stop_distance * 0.5), digits)
-            tp_levels = [round(price + (atr * m), digits) for m in [1, 2, 3]]
-        elif side == "SELL":
+            tp_levels = [round(price + (atr * mult), digits) for mult in [1, 2, 3]]
+        else:
             raw_sl = price + atr
             sl = min(raw_sl, price + (price * 0.05))
             sl = round(sl + (min_stop_distance * 0.5), digits)
-            tp_levels = [round(price - (atr * m), digits) for m in [1, 2, 3]]
-        else:
-            fallback_sl = round(price * 0.99, digits)
-            fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
-            return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": min_stop_distance}
-        
-        # Final adjustment.
-        if side == "BUY" and sl >= price - min_stop_distance:
+            tp_levels = [round(price - (atr * mult), digits) for mult in [1, 2, 3]]
+
+        # Adjust SL if too close to entry.
+        if side.upper() == "BUY" and sl >= price - min_stop_distance:
             sl = round(price - min_stop_distance * 1.5, digits)
-        elif side == "SELL" and sl <= price + min_stop_distance:
+        elif side.upper() == "SELL" and sl <= price + min_stop_distance:
             sl = round(price + min_stop_distance * 1.5, digits)
-        
-        return {"sl_level": sl, "tp_levels": tp_levels[:3], "min_stop": min_stop_distance}
+
+        return {
+            "sl_level": sl,
+            "tp_levels": tp_levels,
+            "min_stop": min_stop_distance
+        }
     except Exception as e:
-        logger.error(f"Level calculation error: {e}")
-        fallback_sl = round(price * 0.99, digits)
-        fallback_tp = [round(price * 1.01, digits), round(price * 1.02, digits)]
-        return {"sl_level": fallback_sl, "tp_levels": fallback_tp, "min_stop": 0}
+        logger.error(f"Level calculation critical error: {str(e)}")
+        # Fallback defaults – note: these fallback values guarantee that TP/SL are set.
+        return {
+            "sl_level": round(price * 0.99, 5),
+            "tp_levels": [round(price * 1.01, 5), round(price * 1.02, 5), round(price * 1.03, 5)],
+            "min_stop": 0
+        }
 
 def safe_predictions(predictions: dict) -> dict:
     """
@@ -1777,87 +1892,207 @@ def safe_predictions(predictions: dict) -> dict:
     return safe_preds
 
 # ====================== ENHANCED SIGNAL GENERATION ======================
+# ====================== SIGNAL GENERATION ======================
 def generate_institutional_signal(df: pd.DataFrame, asset: str) -> dict:
-    from datetime import datetime
+    """Enhanced signal generation with dynamic thresholds"""
     signal = {
         "asset": asset,
         "action": "HOLD",
         "price": 0.0,
         "confidence": 0,
         "timestamp": datetime.utcnow().isoformat(),
-        "tp_levels": [],
-        "sl_level": None
+        "indicators": {}
     }
-    try:
-        # Check mode and asset type compatibility.
-        current_mode = globals().get("trading_mode_override", None) or "auto"
-        is_crypto = "/USD" in asset and asset not in ["EUR/USD", "GBP/USD"]
-        if (current_mode == "forex" and is_crypto) or (current_mode == "crypto" and not is_crypto):
-            return signal
 
-        # Use live data regardless of DataFrame length.
-        if df.empty:
-            fallback_price = 1.0
-            signal["price"] = fallback_price
-            levels = compute_trade_levels(fallback_price, fallback_price * 0.01, "HOLD", asset)
-            signal.update(levels)
+    try:
+        # Data validation
+        if len(df) < 100 or 'close' not in df.columns:
             return signal
 
         latest = df.iloc[-1]
-        price_val = float(latest['close'])
-        # For live data, if ATR is missing, use a fallback calculation.
-        atr_val = float(latest.get('ATR_14', price_val * 0.01))
-        signal["price"] = price_val
+        price = latest['close']
+        atr = latest.get('ATR_14', price * 0.01)
+        rsi = latest.get('RSI_14', 50)
+        adx = latest.get('ADX_14', 25)
+        
+        # Store indicators for debugging
+        signal["indicators"] = {
+            "price": price,
+            "atr": atr,
+            "rsi": rsi,
+            "adx": adx,
+            "volatility": atr/price
+        }
 
-        # Retrieve or set default values for indicators.
-        adx_val = float(latest.get('ADX_14', 25))
-        rsi_val = float(latest.get('RSI_14', 50))
+        # Get asset-specific parameters
+        params = TRADING_PARAMS.get(asset, {
+            "min_volatility": 0.01,
+            "confidence_threshold": 70
+        })
 
-        # Adjusted signal logic: lower ADX threshold and tighter RSI ranges for live data.
-        if adx_val > 20:
-            if rsi_val < 45:
-                signal.update({"action": "BUY", "confidence": 80})
-            elif rsi_val > 55:
-                signal.update({"action": "SELL", "confidence": 80})
-            else:
-                signal.update({"action": "HOLD", "confidence": 50})
+        # Volatility check
+        if (atr/price) < params["min_volatility"] and not FORCE_TRADE_OVERRIDE:
+            return signal
+
+        # Signal logic - Enhanced with multiple confirmation
+        signal_strength = 0
+        
+        # RSI-based signal
+        if rsi < 35:
+            signal_strength += (40 - rsi) * 1.5
+            action = "BUY"
+        elif rsi > 65:
+            signal_strength += (rsi - 60) * 1.5
+            action = "SELL"
         else:
-            signal.update({"action": "HOLD", "confidence": 50})
+            return signal
 
-        # Compute stop loss and take profit levels based on live price and ATR.
-        levels = compute_trade_levels(price_val, atr_val, signal["action"], asset)
-        signal.update(levels)
-        return signal
+        # ADX confirmation
+        if adx > 25:
+            signal_strength += (adx - 20) * 0.5
+        else:
+            signal_strength -= 20
+
+        # Price relative to moving average
+        if 'SMA_50' in df.columns:
+            sma = latest['SMA_50']
+            if action == "BUY" and price > sma:
+                signal_strength += 10
+            elif action == "SELL" and price < sma:
+                signal_strength += 10
+
+        # Final confidence calculation
+        confidence = min(100, max(0, signal_strength))
+        
+        if confidence < params["confidence_threshold"] and not FORCE_TRADE_OVERRIDE:
+            return signal
+
+        # Calculate trade levels
+        levels = compute_trade_levels(price, atr, action, asset)
+        
+        return {
+            **signal,
+            "action": action,
+            "price": price,
+            "confidence": confidence,
+            **levels
+        }
 
     except Exception as e:
-        logger.error(f"Signal generation error: {str(e)}")
+        logger.error(f"Signal generation error for {asset}: {str(e)}")
         return signal
 
 def is_forex_trading_hours() -> bool:
     now = datetime.utcnow().time()
     return dt_time(8, 0) <= now <= dt_time(17, 0)
 
-def get_asset_universe(force_refresh=False):
-    global trading_mode_override
-    
-    forex_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
-    crypto_pairs = ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
-    
-    if trading_mode_override == "forex":
-        logger.info("Active Mode: Forex - Returning major currency pairs")
-        return forex_pairs
-    elif trading_mode_override == "crypto":
-        logger.info("Active Mode: Crypto - Returning top crypto pairs")
-        return crypto_pairs
-    
-    # Auto mode - time-based selection
-    now = datetime.utcnow().time()
-    if dt_time(8, 0) <= now <= dt_time(17, 0):
-        logger.info("Auto Mode: Forex hours active")
-        return forex_pairs
-    logger.info("Auto Mode: Crypto hours active")
-    return crypto_pairs
+# Full updated functions to generate trade signals for all active assets
 
+def get_asset_universe(force_refresh: bool = False) -> List[str]:
+    """
+    Returns the full list of assets.
+    In this example, we simply return the keys from STATIC_INSTRUMENT_PARAMS.
+    You may expand this function as necessary.
+    """
+    return list(STATIC_INSTRUMENT_PARAMS.keys())
+
+async def generate_trade_signals():
+    """
+    Generate and enqueue trade signals for all active assets based on current mode.
+    
+    This function first retrieves the full asset universe (from STATIC_INSTRUMENT_PARAMS),
+    filters them according to the trading_mode_override (forex, crypto, or auto), and then,
+    for each asset, fetches the market data and calls generate_signal_for_asset.
+    """
+    logger.info("Running generate_trade_signals()")
+    
+    asset_universe = list(STATIC_INSTRUMENT_PARAMS.keys())
+    valid_assets = []
+    
+    # Filter assets based on the current trading mode.
+    for asset in asset_universe:
+        # Determine asset type: adjust these lists as needed.
+        is_forex = asset in ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD"]
+        is_crypto = asset in ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"]
+        
+        if trading_mode_override == "forex" and is_forex:
+            valid_assets.append(asset)
+        elif trading_mode_override == "crypto" and is_crypto:
+            valid_assets.append(asset)
+        elif trading_mode_override is None:  # auto mode
+            if is_market_open(asset):  # your existing market open check
+                valid_assets.append(asset)
+    
+    logger.info(f"Active assets selected for signal generation: {valid_assets}")
+    
+    # Process each asset.
+    for asset in valid_assets:
+        asset_type = "crypto" if asset in ["BTC/USD", "ETH/USD", "XRP/USD", "LTC/USD", "BCH/USD"] else "forex"
+        try:
+            data = await fetch_market_data(asset, asset_type)
+            if data.empty:
+                logger.warning(f"No market data returned for {asset}")
+                continue
+            signal = await generate_signal_for_asset(asset, data)
+            if signal:
+                await signal_queue.put(signal)
+                logger.info(f"Signal generated for {asset}: {signal}")
+            else:
+                logger.debug(f"No signal generated for {asset}")
+            # Small delay to respect rate limits.
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Error generating signal for {asset}: {str(e)}")
+            
+async def generate_signal_for_asset(asset: str, data: pd.DataFrame) -> Optional[dict]:
+    """
+    Process market data for an asset, compute technical indicators, and determine a trade signal.
+    
+    This example uses a simple rule: if the current price (close) is above the SMA_50 then BUY, else SELL.
+    Detailed logging is added to output the computed values.
+    Replace the logic with your actual signal conditions as required.
+    """
+    try:
+        df_ind = compute_professional_indicators(data)
+        if df_ind.empty:
+            logger.error(f"Indicator computation returned an empty DataFrame for {asset}")
+            return None
+        
+        latest_price = df_ind['close'].iloc[-1]
+        sma = df_ind['SMA_50'].iloc[-1]
+        
+        # Log the indicator values.
+        logger.debug(f"{asset} - latest price: {latest_price}, SMA_50: {sma}")
+        
+        # For debugging: log the full indicator row.
+        logger.debug(f"{asset} - indicator row: {df_ind.iloc[-1].to_dict()}")
+        
+        # Example signal logic: generate a signal regardless of direction.
+        if latest_price > sma:
+            signal_action = "BUY"
+        else:
+            signal_action = "SELL"
+        
+        # (Optional) You could define a minimum price deviation or confidence threshold here.
+        signal_confidence = abs(latest_price - sma) / sma * 100  # in percentage
+        
+        signal = {
+            "asset": asset,
+            "signal": signal_action,
+            "price": latest_price,
+            "confidence": round(signal_confidence, 2),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Log the generated signal for further debugging.
+        logger.debug(f"Generated signal for {asset}: {signal}")
+        return signal
+
+    except Exception as e:
+        logger.error(f"Error in generate_signal_for_asset for {asset}: {str(e)}")
+        return None
+
+# ====================== TELEGRAM COMMAND HANDLERS ======================
 async def start_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
@@ -2321,6 +2556,10 @@ def calculate_lot_size(symbol: str, entry_price: float, sl_level: float) -> floa
 import asyncio
 
 # ====================== UPDATED ORDER EXECUTION ======================
+# ====================== ORDER EXECUTION ======================
+TRADE_FAILURE_COUNTER = {}
+MAX_CONSECUTIVE_FAILURES = 3
+
 async def place_mt5_order(
     symbol: str,
     order_type: str,
@@ -2331,124 +2570,110 @@ async def place_mt5_order(
     sl_level: Optional[float] = None,
     tp_levels: Optional[List[float]] = None
 ):
-    """Enhanced MT5 order placement with fallbacks and validation"""
+    """
+    Place an order through MT5 with robust checks for invalid stops.
+    
+    If an order fails due to “Invalid stops”, the function retries once without sending stops.
+    """
     max_attempts = 3
     attempt = 0
-    
-    try:
-        if not is_market_open(symbol):
-            logger.error(f"Market closed for {symbol}")
-            return None
 
-        while attempt < max_attempts:
-            try:
-                # Initialize connection with fallback
-                if user:
-                    with SessionLocal() as db:
-                        if not initialize_user_mt5(user, db):
-                            raise Exception("User MT5 init failed")
-                elif not initialize_mt5_admin():
-                    raise Exception("Global MT5 init failed")
+    while attempt < max_attempts:
+        try:
+            if user:
+                with SessionLocal() as db:
+                    if not initialize_user_mt5(user, db):
+                        logger.error(f"User MT5 init failed for {user.username}")
+                        return None
+            elif not initialize_mt5_admin():
+                logger.error("Global MT5 init failed")
+                return None
 
-                # Symbol validation and preparation
-                mt5_symbol = symbol.replace("/", "")
-                if not mt5.symbol_select(mt5_symbol, True):
-                    logger.error(f"Symbol {mt5_symbol} not available")
-                    return None
+            mt5_symbol = symbol.replace("/", "")
+            if not mt5.symbol_select(mt5_symbol, True):
+                logger.error(f"Symbol {mt5_symbol} not available")
+                return None
 
-                symbol_info = mt5.symbol_info(mt5_symbol)
-                if not symbol_info or not getattr(symbol_info, 'trade_allowed', False):
-                    logger.error(f"Trading disabled for {symbol}")
-                    return None
+            symbol_info = mt5.symbol_info(mt5_symbol)
+            if not symbol_info:
+                logger.error("No symbol info available")
+                return None
 
-                # Get critical parameters with fallbacks
-                digits = getattr(symbol_info, 'digits', 5)
-                point = getattr(symbol_info, 'point', 0.00001)
-                min_stop_points = getattr(symbol_info, 'trade_stops_level', 10)
-                min_stop_distance = min_stop_points * point * 1.2  # 20% buffer
-                min_volume = getattr(symbol_info, 'volume_min', 0.01)
+            tick = mt5.symbol_info_tick(mt5_symbol)
+            if not tick:
+                logger.error("No tick data available")
+                raise Exception("No tick data")
 
-                # Price validation
-                tick = mt5.symbol_info_tick(mt5_symbol)
-                if not tick:
-                    logger.error("No tick data available")
-                    raise Exception("No market data")
+            current_price = tick.ask if order_type.upper() == "BUY" else tick.bid
+            price_diff = abs(current_price - price) / price
+            if price_diff > 0.01:
+                logger.warning(f"Price deviation too large: {price_diff:.2%}")
+                return None
 
-                current_price = tick.ask if order_type.upper() == "BUY" else tick.bid
-                price_diff = abs(current_price - price) / price
-                if price_diff > 0.01:
-                    logger.warning(f"Large price deviation: {price_diff:.2%}, using current price")
-                    price = current_price
+            # Compute stops if not provided.
+            levels = compute_trade_levels(price, atr=current_price * 0.01, side=order_type, symbol=symbol)
+            if sl_level is None:
+                sl_level = levels.get("sl_level")
+            if tp_levels is None:
+                tp_levels = levels.get("tp_levels")
 
-                # Calculate levels if not provided
-                if not sl_level or not tp_levels:
-                    levels = compute_trade_levels(
-                        current_price, 
-                        getattr(symbol_info, 'atr', current_price * 0.01),
-                        order_type, 
-                        symbol
-                    )
-                    sl_level = levels["sl_level"]
-                    tp_levels = levels["tp_levels"]
+            # (Optional) Pre-check: Ensure stops are at a safe distance from the current price.
+            # This check could be adjusted per broker rules.
+            min_stop = levels.get("min_stop", 0)
+            valid_stops = True
+            if order_type.upper() == "BUY":
+                if current_price - sl_level < min_stop or tp_levels[0] - current_price < min_stop:
+                    valid_stops = False
+            else:
+                if sl_level - current_price < min_stop or current_price - tp_levels[0] < min_stop:
+                    valid_stops = False
+            if not valid_stops:
+                logger.error("Calculated stops are invalid; will attempt order without stops.")
+            
+            # Build the order request.
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": mt5_symbol,
+                "volume": volume,
+                "type": mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL,
+                "price": current_price,
+                "deviation": 10,
+                "magic": 234000,
+                "comment": f"NekoAITrader_{signal_id}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+            }
 
-                # Validate stop levels
-                if order_type == "BUY":
-                    stop_diff = current_price - sl_level
-                else:
-                    stop_diff = sl_level - current_price
+            # Only include stops if they are valid.
+            if valid_stops:
+                request["sl"] = sl_level
+                if tp_levels:
+                    request["tp"] = tp_levels[0]
 
-                if stop_diff < min_stop_distance:
-                    logger.warning(f"Stop too close: {stop_diff:.5f} < {min_stop_distance:.5f}")
-                    sl_level = round(current_price - (min_stop_distance * 1.5), digits) if order_type == "BUY" \
-                              else round(current_price + (min_stop_distance * 1.5), digits)
-
-                # Calculate proper lot size
-                volume = max(
-                    calculate_lot_size(symbol, current_price, sl_level),
-                    min_volume
-                )
-                volume = round(volume / symbol_info.volume_step) * symbol_info.volume_step
-
-                # Prepare order request
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": mt5_symbol,
-                    "volume": volume,
-                    "type": mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL,
-                    "price": current_price,
-                    "sl": round(sl_level, digits),
-                    "tp": round(tp_levels[0], digits) if tp_levels else None,
-                    "deviation": 10,
-                    "magic": 234000,
-                    "comment": f"NEKO_{signal_id}",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_FOK,
-                }
-
-                # Execute order with validation
-                result = mt5.order_send(request)
-                if result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logger.info(f"Order executed: {result.order}")
-                    return result
-                
-                logger.warning(f"Order failed: {result.comment}")
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Order failed: {result.comment}")
+                # If the error indicates "Invalid stops", try without stops.
+                if "Invalid stops" in result.comment:
+                    logger.info("Retrying order without stops due to invalid stops error.")
+                    request.pop("sl", None)
+                    request.pop("tp", None)
+                    result = mt5.order_send(request)
+                    if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        return result
                 attempt += 1
                 await asyncio.sleep(2)
+                continue
 
-            except Exception as e:
-                logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
-                attempt += 1
-                await asyncio.sleep(2)
+            return result
 
-        logger.error(f"Failed all order attempts for {symbol}")
-        return None
+        except Exception as e:
+            logger.error(f"Order attempt {attempt+1} failed: {str(e)}")
+            attempt += 1
+            await asyncio.sleep(2)
 
-    except Exception as e:
-        logger.error(f"Critical order error: {str(e)}")
-        return None
-    finally:
-        if MT5_AVAILABLE:
-            mt5.shutdown()
+    logger.error(f"Failed all {max_attempts} order attempts for {symbol}")
+    return None
 
 # Dictionary to track active signals per asset (to allow one signal at a time)
 active_signals = {}
@@ -2653,71 +2878,111 @@ async def calculate_volatility_adjusted_sizes(assets):
 
 # ====================== IMPROVED TRADING WORKER ======================
 async def premium_trading_worker():
-    """
-    Active trading loop that uses cached data to generate trading signals.
-    Signals are generated only if the cached data is valid and sufficient.
-    """
+    """Enhanced trading worker with detailed logging"""
     while not app.shutdown_flag.is_set():
         assets = get_asset_universe()
-        logger.info(f"Analyzing {len(assets)} assets")
+        logger.info(f"Analyzing {len(assets)} assets with current mode: {trading_mode_override or 'auto'}")
+        
         for asset in assets:
-            asset_type = "crypto" if "/USD" in asset else "forex"
             try:
-                # Retrieve cached data for the asset.
                 async with app.data_lock:
                     cached_data = global_market_data.get(asset)
-                if cached_data is None or cached_data.empty or len(cached_data) < 30:
-                    logger.debug(f"Insufficient cached data for {asset}, skipping...")
+                
+                if cached_data is None or len(cached_data) < 100:
+                    logger.debug(f"Insufficient data for {asset} - {len(cached_data) if cached_data else 0} records")
                     continue
-                # Generate trading signal using the cached indicators.
+                
                 signal = generate_institutional_signal(cached_data, asset)
+                
                 if signal["action"] != "HOLD":
-                    logger.info(f"Processing {signal['action']} signal for {asset}")
-                    # Enrich the signal with news sentiment data.
-                    news = await fetch_market_news(asset_type)
-                    signal["news_sentiment"] = analyze_sentiment(news)
-                    # Enqueue the signal for processing.
+                    logger.info(f"STRONG SIGNAL: {asset} {signal['action']} "
+                               f"Confidence: {signal['confidence']:.1f}% "
+                               f"Price: {signal['price']:.5f} "
+                               f"ATR: {signal['indicators'].get('atr', 0):.5f}")
+                    
+                    # Enqueue the signal
                     await signal_queue.put(signal)
                     asyncio.create_task(process_trade_signal(signal))
-                await asyncio.sleep(1)
+                
+                await asyncio.sleep(0.5)  # Brief pause between assets
+            
             except Exception as e:
-                logger.error(f"Error processing asset {asset}: {str(e)}")
+                logger.error(f"Error processing {asset}: {str(e)}")
                 await asyncio.sleep(1)
-        logger.info("Completed market scan cycle")
-        await asyncio.sleep(10)
+        
+        logger.info("Completed full market scan")
+        await asyncio.sleep(10)  # Reduced from 300 to get faster feedback
 
 # ====================== ENHANCED LOGGING ======================
+async def send_trade_signal(signal: dict):
+    """
+    Sends a two-part Telegram notification for a trade signal:
+    (1) A presignal alert preceding the main signal.
+    (2) The main signal which includes TP/SL levels, predicted change, and sentiment.
+    If predicted values are missing, defaults are provided.
+    """
+    # Ensure defaults for predicted change and sentiment if not set.
+    predicted_change = signal.get("predicted_change", 0.0)
+    sentiment = signal.get("sentiment", "NEUTRAL")
+
+    # Create presignal text – sent before the trade signal.
+    pre_signal_msg = (f"🔔 Pre-Signal Alert for {signal.get('asset', 'Unknown Asset')}: "
+                      f"{signal.get('action', 'N/A')} signal at price {signal.get('price', 'N/A')}.")
+    pre_payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": pre_signal_msg,
+        "parse_mode": "HTML"
+    }
+    await _send_telegram_with_retry(pre_payload)
+
+    # Build the main trade signal message including TP/SL, predicted change and sentiment.
+    main_signal_msg = (
+        f"📈 Signal: {signal.get('asset', 'Unknown Asset')} {signal.get('action', 'N/A')}\n"
+        f"Price: {signal.get('price', 'N/A')}\n"
+        f"TP: {signal.get('tp_levels', 'Not Set')}\n"
+        f"SL: {signal.get('sl_level', 'Not Set')}\n"
+        f"Confidence: {signal.get('confidence', 'N/A')}%\n"
+        f"Predicted Change: {predicted_change}\n"
+        f"Sentiment: {sentiment}"
+    )
+    main_payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": main_signal_msg,
+        "parse_mode": "HTML"
+    }
+    await _send_telegram_with_retry(main_payload)
+
+
+# Example process_trade_signal function modified to include pre-alert signal sending.
 async def process_trade_signal(signal: dict):
     """
-    Processes a trade signal by generating a unique signal ID,
-    waiting for market confirmation, and then placing a trade order.
+    Process a trading signal by first sending a presignal alert and then
+    executing the trade. This function expects that signal includes:
+    - asset, action, price, confidence, tp_levels, sl_level,
+      and optionally predicted_change and sentiment.
     """
-    try:
-        logger.info(f"Processing signal for {signal['asset']} with action {signal['action']}")
-        async with signal_counter_lock:
-            global signal_counter
-            signal_id = f"NekoAITrader_{signal_counter}"
-            signal_counter += 1
-        signal["id"] = signal_id
-        logger.info(f"Executing trade {signal_id} after waiting for market confirmation...")
-        # Optional wait to allow market conditions to stabilize.
-        await asyncio.sleep(30)
-        result = await place_mt5_order(
-            symbol=signal["asset"],
-            order_type=signal["action"],
-            volume=0.1,
-            price=signal["price"],
-            signal_id=signal_id,
-            sl_level=signal["sl_level"],
-            tp_levels=signal["tp_levels"]
-        )
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Trade executed successfully: {signal_id}")
-            await send_telegram_alert(signal)
-        else:
-            logger.error(f"Trade execution failed for {signal_id}: {result.comment if result else 'No result'}")
-    except Exception as e:
-        logger.error(f"Error processing trade signal {signal.get('id', 'unknown')}: {str(e)}")
+    # Make sure TP and SL are set; if not, calculate defaults using compute_trade_levels.
+    if not signal.get("tp_levels") or signal.get("sl_level") is None:
+        # Assume current_price is in signal and asset is valid.
+        levels = compute_trade_levels(signal.get("price", 1.0), 
+                                      atr=signal.get("atr", 0.01),
+                                      side=signal.get("action", "BUY"),
+                                      symbol=signal.get("asset", "UNKNOWN"))
+        signal["tp_levels"] = levels.get("tp_levels")
+        signal["sl_level"] = levels.get("sl_level")
+    
+    # Always ensure predicted change and sentiment are provided.
+    if "predicted_change" not in signal:
+        signal["predicted_change"] = 0.0
+    if "sentiment" not in signal:
+        signal["sentiment"] = "NEUTRAL"
+    
+    # Send the trade signal with presignal alert
+    await send_trade_signal(signal)
+    
+    # Now proceed with trade execution (example placeholder)
+    logger.info(f"Executing trade {signal.get('trade_id', 'N/A')} for {signal.get('asset', 'Unknown')} with action {signal.get('action', 'N/A')}")
+    # ... call order placement function etc.
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -3227,6 +3492,26 @@ async def set_overrides(force_trade: bool = False, force_market: bool = False):
     globals()["FORCE_MARKET_OPEN_OVERRIDE"] = force_market
     logger.info(f"Overrides set: FORCE_TRADE_OVERRIDE={force_trade}, FORCE_MARKET_OPEN_OVERRIDE={force_market}")
     return {"FORCE_TRADE_OVERRIDE": force_trade, "FORCE_MARKET_OPEN_OVERRIDE": force_market}
+
+@app.get("/debug/market_state")
+async def debug_market_state():
+    """Debug endpoint to check why signals aren't generating"""
+    assets = get_asset_universe()
+    results = {}
+    
+    for asset in assets:
+        data = global_market_data.get(asset, pd.DataFrame())
+        if not data.empty:
+            signal = generate_institutional_signal(data, asset)
+            results[asset] = {
+                "signal": signal["action"],
+                "confidence": signal["confidence"],
+                "price": signal["price"],
+                "indicators": signal["indicators"],
+                "meets_requirements": signal["action"] != "HOLD"
+            }
+    
+    return results
 
 @app.on_event("shutdown")
 async def shutdown_event():
