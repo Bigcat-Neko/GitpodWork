@@ -41,6 +41,10 @@ from stable_baselines3.common.sb2_compat.rmsprop_tf_like import RMSpropTFLike
 from stable_baselines3.common.vec_env import DummyVecEnv
 from diskcache import Cache
 import threading
+import nest_asyncio
+nest_asyncio.apply()
+from tenacity import retry, stop_after_attempt, wait_exponential
+from cryptography.fernet import Fernet
 # Add these with your other imports
 from telegram import Update
 from telegram.ext import (
@@ -55,15 +59,27 @@ from telegram.ext import (
 model_sync_lock = threading.Lock()
 
 # Try to import MetaTrader5; if unavailable, disable trading functions.
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+USE_MOCK_MT5 = os.getenv("USE_MOCK_MT5", "true").lower() == "true"
+
 try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
+    if USE_MOCK_MT5:
+        print("[INFO] Running in MOCK mode. Using mock_mt5 module.")
+        from mock_mt5 import MockMT5, MockOrderSendResult
+        mt5 = MockMT5()
+        mt5.OrderSendResult = MockOrderSendResult
+        MT5_AVAILABLE = False  # Optional: you can make this True if mocks should count
+    else:
+        import MetaTrader5 as mt5
+        print("[INFO] MetaTrader5 successfully imported.")
+        MT5_AVAILABLE = True
 except ImportError:
+    print("[WARN] MetaTrader5 package not available. Trading functionality will be disabled.")
     MT5_AVAILABLE = False
-    print("MetaTrader5 package not available. Trading functionality will be disabled.")
-import nest_asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
-from cryptography.fernet import Fernet
+    mt5 = None
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
