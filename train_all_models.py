@@ -287,7 +287,7 @@ def train_xgboost():
     }
     evallist = [(dval, 'eval')]
     xgb_model = xgb.train(params, dtrain, num_boost_round=200, evals=evallist, early_stopping_rounds=20)
-    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_iteration + 1)
+    y_pred = xgb_model.predict(dval, ntree_limit=xgb_model.best_ntree_limit)
     rmse = np.sqrt(mean_squared_error(y_val, y_pred))
     print("XGBoost Validation RMSE:", rmse)
     xgb_model.save_model("models/xgboost_model.json")
@@ -392,11 +392,15 @@ def train_a2c():
 
 def train_sac():
     print("\n===== Training SAC Model =====")
-    env = TradingEnv()  # Ensure that your environment supports the SAC settings
-    model = SAC("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=50000)
-    model.save("models/sac_model")
-    print("SAC model saved as models/sac_model")
+    env = TradingEnv()  # TradingEnv currently uses a discrete action space.
+    try:
+        model = SAC("MlpPolicy", env, verbose=1)
+        model.learn(total_timesteps=50000)
+        model.save("models/sac_model")
+        print("SAC model saved as models/sac_model")
+    except AssertionError as e:
+        print("Skipping SAC training: incompatible action space (SAC requires a continuous action space).")
+        print(e)
 
 # =============================================================================
 # 8. Graph Neural Network (Placeholder)
